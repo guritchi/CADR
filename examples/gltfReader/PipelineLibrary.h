@@ -8,6 +8,20 @@ class VulkanDevice;
 }
 
 
+struct PipelineWrapper {
+    vk::Pipeline pipeline = {};
+    std::string name;
+
+    PipelineWrapper& operator=(vk::Pipeline p) {
+        pipeline = p;
+        return *this;
+    }
+
+    operator vk::Pipeline() const {
+        return pipeline;
+    }
+};
+
 class PipelineLibrary {
 protected:
 	static constexpr const size_t _numTrianglePipelines = 32;
@@ -15,9 +29,16 @@ protected:
 	static constexpr const size_t _numPointPipelines    = 8;
 	static constexpr const size_t _numPipelines = _numTrianglePipelines + _numLinePipelines + _numPointPipelines;
 	std::array<vk::ShaderModule, 8> _vertexShaders;
-	std::array<vk::ShaderModule, 8> _fragmentShaders;
+	std::array<vk::ShaderModule, 8 + 4> _fragmentShaders;
 	std::array<vk::ShaderModule, 8> _pointVertexShaders;
-	std::array<vk::Pipeline, _numPipelines> _pipelines;
+	std::array<PipelineWrapper, _numPipelines> _pipelines;
+
+    static constexpr const size_t _numUberTrianglePipelines = 16;
+    static constexpr const size_t _numUberLinePipelines     = 4;
+    static constexpr const size_t _numUberPointPipelines    = 4;
+    static constexpr const size_t _numUberPipelines = _numUberTrianglePipelines + _numUberLinePipelines + _numUberPointPipelines;
+    std::array<PipelineWrapper, _numUberPipelines> _uberPipelines;
+
 	CadR::VulkanDevice* _device = nullptr;
 	vk::PipelineLayout _pipelineLayout;
 	vk::PipelineLayout _texturePipelineLayout;
@@ -40,7 +61,12 @@ public:
 
 	// all pipelines
 	static constexpr size_t numPipelines();
-	vk::Pipeline pipeline(size_t index) const;
+    static constexpr size_t numUberPipelines();
+	vk::Pipeline pipeline(size_t index, bool useUberShader) const;
+
+    std::string pipelineName(size_t index, bool useUberShader) const {
+        return useUberShader? _uberPipelines[index].name : _pipelines[index].name;
+    }
 
 	// triangle pipelines
 	static constexpr size_t numTrianglePipelines();
@@ -76,13 +102,14 @@ inline vk::ShaderModule PipelineLibrary::vertexShader(size_t index)   const  { r
 inline vk::ShaderModule PipelineLibrary::fragmentShader(size_t index) const  { return _fragmentShaders[index]; }
 inline vk::ShaderModule PipelineLibrary::pointVertexShader(size_t index)   const  { return _pointVertexShaders[index]; }
 inline constexpr size_t PipelineLibrary::numPipelines()          { return _numPipelines; }
+inline constexpr size_t PipelineLibrary::numUberPipelines()          { return _numUberPipelines; }
 inline constexpr size_t PipelineLibrary::numTrianglePipelines()  { return _numTrianglePipelines; }
 inline constexpr size_t PipelineLibrary::numLinePipelines()      { return _numLinePipelines; }
 inline constexpr size_t PipelineLibrary::numPointPipelines()     { return _numPointPipelines; }
 inline constexpr unsigned PipelineLibrary::getTrianglePipelineIndex(bool phong, bool texturing, bool perVertexColor, bool backFaceCulling, vk::FrontFace frontFace)  { return (frontFace==vk::FrontFace::eClockwise?0x10:0)+(backFaceCulling?8:0)+(phong?4:0)+(texturing?2:0)+(perVertexColor?1:0); }
 inline constexpr unsigned PipelineLibrary::getLinePipelineIndex(bool phong, bool texturing, bool perVertexColor)  { return _numTrianglePipelines+(phong?4:0)+(texturing?2:0)+(perVertexColor?1:0); }
 inline constexpr unsigned PipelineLibrary::getPointPipelineIndex(bool phong, bool texturing, bool perVertexColor)  { return _numTrianglePipelines+_numLinePipelines+(phong?4:0)+(texturing?2:0)+(perVertexColor?1:0); }
-inline vk::Pipeline PipelineLibrary::pipeline(size_t index) const  { return _pipelines[index]; }
+inline vk::Pipeline PipelineLibrary::pipeline(size_t index, bool useUberShader) const  { return useUberShader? _uberPipelines[index] : _pipelines[index]; }
 inline vk::Pipeline PipelineLibrary::trianglePipeline(size_t index) const  { return _pipelines[index]; }
 inline vk::Pipeline PipelineLibrary::linePipeline(size_t index)     const  { return _pipelines[_numTrianglePipelines+index]; }
 inline vk::Pipeline PipelineLibrary::pointPipeline(size_t index)    const  { return _pipelines[_numTrianglePipelines+_numLinePipelines+index]; }

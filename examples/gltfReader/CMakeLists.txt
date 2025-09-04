@@ -27,6 +27,7 @@ set(APP_SHADERS
 	"shaders/baseColorUberShader.vert  shaders/baseColor       .vert.spv"
 	"shaders/baseColorUberShader.frag  shaders/baseColor       .frag.spv"
 	"shaders/baseColorUberShader.vert  shaders/baseColorPoint  .vert.spv  -DPOINT_SHADER"
+	"shaders/uberShader.frag           shaders/uber            .frag.spv"
 	)
 
 # dependencies

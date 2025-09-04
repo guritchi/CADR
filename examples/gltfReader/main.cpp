@@ -76,6 +76,21 @@ public:
 	void mouseWheel(VulkanWindow& window, float wheelX, float wheelY, const VulkanWindow::MouseState& mouseState);
 	void key(VulkanWindow& window, VulkanWindow::KeyState keyState, VulkanWindow::ScanCode scanCode);
 
+    void setPipelines() {
+        for(size_t i=0; i<pipelineLibrary.numPipelines(); i++) {
+            auto u = 4 * (i / 8) + i % 4;
+            std::cout << i << ":\n";
+            std::cout << "  " << pipelineLibrary.pipelineName(i, false) << "\n";
+            std::cout << "  " << pipelineLibrary.pipelineName(u, true) << "\n";
+            if (useUberShader) {
+                pipelineStateSetList[i].pipeline.set(pipelineLibrary.pipeline(u, true));
+            }
+            else {
+                pipelineStateSetList[i].pipeline.set(pipelineLibrary.pipeline(i, false));
+            }
+        }
+    }
+
 	// Vulkan core objects
 	// (The order of members is not arbitrary but defines construction and destruction order.)
 	// (If App object is on the stack, do not call std::exit() as the App destructor might not be called.)
@@ -149,6 +164,8 @@ public:
 	vector<CadR::Sampler> samplerDB;
 	vector<CadR::Texture> textureDB;
 	CadR::Sampler defaultSampler;
+
+    bool useUberShader = true;
 
 };
 
@@ -345,11 +362,11 @@ void App::init()
 	// init Vulkan and window
 	VulkanWindow::init();
 	vulkanLib.load(CadR::VulkanLibrary::defaultName());
-	vulkanInstance.create(vulkanLib, "glTF reader", 0, "CADR", 0, VK_API_VERSION_1_2, nullptr,
+	vulkanInstance.create(vulkanLib, "glTF reader", 0, "CADR", 0, VK_API_VERSION_1_2, {"VK_LAYER_LUNARG_monitor"},
 	                      VulkanWindow::requiredExtensions());
-	window.create(VkInstance(vulkanInstance), {1024,768}, "glTF reader", vulkanLib.vkGetInstanceProcAddr);
+    window.create(VkInstance(vulkanInstance), {1024,768}, "glTF reader", vulkanLib.vkGetInstanceProcAddr);
 
-	// init device and renderer
+    // init device and renderer
 	tuple<vk::PhysicalDevice, uint32_t, uint32_t> deviceAndQueueFamilies =
 			vulkanInstance.chooseDevice(
 				vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute,  // queueOperations
@@ -393,8 +410,8 @@ void App::init()
 	);
 	graphicsQueueFamily = std::get<1>(deviceAndQueueFamilies);
 	presentationQueueFamily = std::get<2>(deviceAndQueueFamilies);
-	window.setDevice(VkDevice(device), physicalDevice);
-	renderer.init(device, vulkanInstance, physicalDevice, graphicsQueueFamily);
+    window.setDevice(VkDevice(device), physicalDevice);
+    renderer.init(device, vulkanInstance, physicalDevice, graphicsQueueFamily);
 
 	// get queues
 	graphicsQueue = device.getQueue(graphicsQueueFamily, 0);
@@ -2390,7 +2407,6 @@ void App::init()
 	renderer.executeCopyOperations();
 }
 
-
 void App::resize(VulkanWindow& window,
 	const vk::SurfaceCapabilitiesKHR& surfaceCapabilities, vk::Extent2D newSurfaceExtent)
 {
@@ -2436,8 +2452,7 @@ void App::resize(VulkanWindow& window,
 
 	// recreate pipelines
 	pipelineLibrary.create(device, newSurfaceExtent, specializationInfo, renderPass, renderer.pipelineCache());
-	for(size_t i=0; i<pipelineLibrary.numPipelines(); i++)
-		pipelineStateSetList[i].pipeline.set(pipelineLibrary.pipeline(i));
+    setPipelines();
 
 	// print info
 	cout << "Recreating swapchain (extent: " << newSurfaceExtent.width << "x" << newSurfaceExtent.height
@@ -2701,6 +2716,16 @@ void App::frame(VulkanWindow&)
 			sceneDataAllocation.deviceAddress(),  // sceneDataPtr
 		}.data()
 	);
+    device.cmdPushConstants(
+            commandBuffer,  // commandBuffer
+            pipelineLibrary.pipelineLayout(),  // pipelineLayout
+            vk::ShaderStageFlagBits::eFragment,  // stageFlags
+            20,  // offset
+            sizeof(uint32_t),  // size
+            array<uint32_t,1>{  // pValues
+                0
+            }.data()
+    );
 	renderer.recordSceneRendering(
 		commandBuffer,  // commandBuffer
 		stateSetRoot,  // stateSetRoot
@@ -2797,6 +2822,24 @@ void App::mouseWheel(VulkanWindow& window, float wheelX, float wheelY, const Vul
 	window.scheduleFrame();
 }
 
+void App::key(VulkanWindow& window, VulkanWindow::KeyState keyState, VulkanWindow::ScanCode scanCode)
+{
+    std::cout << "key: " << (int)scanCode << "\n";
+    if (keyState == VulkanWindow::KeyState::Pressed) {
+        if (scanCode == VulkanWindow::ScanCode::One) {
+            useUberShader = true;
+            setPipelines();
+            window.scheduleFrame();
+            std::cout << "Switched to uber shader\n";
+        }
+        else if (scanCode == VulkanWindow::ScanCode::Two) {
+            useUberShader = false;
+            setPipelines();
+            window.scheduleFrame();
+            std::cout << "Switched to regular shader\n";
+        }
+    }
+}
 
 uint32_t getStride(int componentType,const string& type)
 {
@@ -2925,6 +2968,9 @@ try {
 	app.window.setMouseWheelCallback(
 		bind(&App::mouseWheel, &app, placeholders::_1, placeholders::_2, placeholders::_3, placeholders::_4)
 	);
+    app.window.setKeyCallback(
+        bind(&App::key, &app, placeholders::_1, placeholders::_2, placeholders::_3)
+    );
 
 	// show window and run main loop
 	app.window.show();

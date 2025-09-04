@@ -80,6 +80,19 @@ static const uint32_t phongPerVertexColorTexturingFragmentShaderSpirv[]={
 #include "shaders/phong-perVertexColor-texturing.frag.spv"
 };
 
+static const uint32_t uberOverallMaterialFragmentShaderSpirv[]={
+#include "shaders/uber-overallMaterial.frag.spv"
+};
+static const uint32_t uberPerVertexColorFragmentShaderSpirv[]={
+#include "shaders/uber-perVertexColor.frag.spv"
+};
+static const uint32_t uberOverallMaterialTexturingFragmentShaderSpirv[]={
+#include "shaders/uber-overallMaterial-texturing.frag.spv"
+};
+static const uint32_t uberPerVertexColorTexturingFragmentShaderSpirv[]={
+#include "shaders/uber-perVertexColor-texturing.frag.spv"
+};
+
 static constexpr array vertexShaderSpirvList = {
 	tuple{ baseColorOverallMaterialVertexShaderSpirv,          sizeof(baseColorOverallMaterialVertexShaderSpirv) },
 	tuple{ baseColorPerVertexColorVertexShaderSpirv,           sizeof(baseColorPerVertexColorVertexShaderSpirv) },
@@ -90,6 +103,16 @@ static constexpr array vertexShaderSpirvList = {
 	tuple{ phongOverallMaterialTexturingVertexShaderSpirv, sizeof(phongOverallMaterialTexturingVertexShaderSpirv) },
 	tuple{ phongPerVertexColorTexturingVertexShaderSpirv,  sizeof(phongPerVertexColorTexturingVertexShaderSpirv) },
 };
+static constexpr array vertexShaderNameList = {
+        "baseColorOverallMaterialVertex",
+        "baseColorPerVertexColorVertex",
+        "baseColorOverallMaterialTexturingVertex",
+        "baseColorPerVertexColorTexturingVertex",
+        "phongOverallMaterialVertexShader",
+        "phongPerVertexColorVertexShader",
+        "phongOverallMaterialTexturingVertex",
+        "phongPerVertexColorTexturingVertex",
+};
 static constexpr array fragmentShaderSpirvList = {
 	tuple{ baseColorOverallMaterialFragmentShaderSpirv,          sizeof(baseColorOverallMaterialFragmentShaderSpirv) },
 	tuple{ baseColorPerVertexColorFragmentShaderSpirv,           sizeof(baseColorPerVertexColorFragmentShaderSpirv) },
@@ -99,6 +122,24 @@ static constexpr array fragmentShaderSpirvList = {
 	tuple{ phongPerVertexColorFragmentShaderSpirv,           sizeof(phongPerVertexColorFragmentShaderSpirv) },
 	tuple{ phongOverallMaterialTexturingFragmentShaderSpirv, sizeof(phongOverallMaterialTexturingFragmentShaderSpirv) },
 	tuple{ phongPerVertexColorTexturingFragmentShaderSpirv,  sizeof(phongPerVertexColorTexturingFragmentShaderSpirv) },
+    tuple{ uberOverallMaterialFragmentShaderSpirv,          sizeof(uberOverallMaterialFragmentShaderSpirv) },
+    tuple{ uberPerVertexColorFragmentShaderSpirv,           sizeof(uberPerVertexColorFragmentShaderSpirv) },
+    tuple{ uberOverallMaterialTexturingFragmentShaderSpirv, sizeof(uberOverallMaterialTexturingFragmentShaderSpirv) },
+    tuple{ uberPerVertexColorTexturingFragmentShaderSpirv,  sizeof(uberPerVertexColorTexturingFragmentShaderSpirv) },
+};
+static constexpr array fragmentShaderNameList = {
+        "baseColorOverallMaterialFragment",
+        "baseColorPerVertexColorFragment",
+        "baseColorOverallMaterialTexturingFragment",
+        "baseColorPerVertexColorTexturingFragment",
+        "phongOverallMaterialFragment",
+        "phongPerVertexColorFragment",
+        "phongOverallMaterialTexturingFragment",
+        "phongPerVertexColorTexturingFragment",
+        "uberOverallMaterialFragment",
+        "uberPerVertexColorFragment",
+        "uberOverallMaterialTexturingFragment",
+        "uberPerVertexColorTexturingFragment",
 };
 static constexpr array pointVertexShaderSpirvList = {
 	tuple{ baseColorPointOverallMaterialVertexShaderSpirv,          sizeof(baseColorPointOverallMaterialVertexShaderSpirv) },
@@ -110,6 +151,17 @@ static constexpr array pointVertexShaderSpirvList = {
 	tuple{ phongPointOverallMaterialTexturingVertexShaderSpirv, sizeof(phongPointOverallMaterialTexturingVertexShaderSpirv) },
 	tuple{ phongPointPerVertexColorTexturingVertexShaderSpirv,  sizeof(phongPointPerVertexColorTexturingVertexShaderSpirv) },
 };
+static constexpr array pointVertexShaderNameList = {
+        "baseColorPointOverallMaterialVertex",
+        "baseColorPointPerVertexColorVertex",
+        "baseColorPointOverallMaterialTexturingVertex",
+        "baseColorPointPerVertexColorTexturingVertex",
+        "phongPointOverallMaterialVertex",
+        "phongPointPerVertexColorVertex",
+        "phongPointOverallMaterialTexturingVertex",
+        "phongPointPerVertexColorTexturingVertex",
+};
+
 
 
 
@@ -118,7 +170,7 @@ void PipelineLibrary::destroy() noexcept
 	if(_device == nullptr)
 		return;
 
-	for(vk::Pipeline& p : _pipelines) {
+	for(auto& p : _pipelines) {
 		_device->destroy(p);
 		p = nullptr;
 	}
@@ -216,12 +268,12 @@ void PipelineLibrary::create(CadR::VulkanDevice& device)
 						vk::PushConstantRange{  // pPushConstantRanges
 							vk::ShaderStageFlagBits::eVertex,  // stageFlags
 							0,  // offset
-							2*sizeof(uint64_t)  // size
+							2*sizeof(uint64_t) + sizeof(uint32_t) // size
 						},
 						vk::PushConstantRange{  // pPushConstantRanges
 							vk::ShaderStageFlagBits::eFragment,  // stageFlags
 							8,  // offset
-							sizeof(uint64_t) + sizeof(uint32_t)  // size
+							sizeof(uint64_t) + 2*sizeof(uint32_t)  // size
 						},
 					}.data()
 				)
@@ -260,7 +312,7 @@ void PipelineLibrary::create(CadR::VulkanDevice& device, vk::Extent2D surfaceExt
 	create(device);
 
 	// destroy previous pipelines
-	for(vk::Pipeline& p : _pipelines) {
+	for(auto& p : _pipelines) {
 		_device->destroy(p);
 		p = nullptr;
 	}
@@ -373,13 +425,19 @@ void PipelineLibrary::create(CadR::VulkanDevice& device, vk::Extent2D surfaceExt
 	// create new triangle pipelines
 	inputAssemblyState.topology = vk::PrimitiveTopology::eTriangleList;
 	for(size_t i=0; i<_numTrianglePipelines; i++) {
+        std::string name = "[" + std::to_string(i) + "]     Triangle ";
 		shaderStages[0].module = _vertexShaders[i&0x7];
+        name += vertexShaderNameList[i&0x7];
 		shaderStages[1].module = _fragmentShaders[i&0x7];
+        name += " ";
+        name += fragmentShaderNameList[i&0x7];
 		rasterizationState.cullMode =
 			(i&0x08)==0 ? vk::CullModeFlagBits::eNone :  // eNone - nothing is discarded,
 			              vk::CullModeFlagBits::eBack;  // eBack - back-facing triangles are discarded, eFront - front-facing triangles are discarded
+        name +=( (i&0x08)==0 ? ", eNone" : ", eBack");
 		rasterizationState.frontFace =
 			(i&0x10) ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
+        name +=( (i&0x10)==0 ? ", eClockwise" : ", eCounterClockwise");
 		createInfo.layout =
 			(i&0x02) ? _texturePipelineLayout : _pipelineLayout;
 		_pipelines[i] =
@@ -387,7 +445,33 @@ void PipelineLibrary::create(CadR::VulkanDevice& device, vk::Extent2D surfaceExt
 				pipelineCache,  // pipelineCache
 				createInfo  // createInfo
 			);
+
+        _pipelines[i].name = name;
 	}
+    // uber triangle pipelines
+    for(size_t i=0; i<_numUberTrianglePipelines; i++) {
+        std::string name = "[" + std::to_string(i) + "] UberTriangle ";
+        shaderStages[0].module = _vertexShaders[(i&0x3) + 4];
+        name += vertexShaderNameList[(i&0x3) + 4];
+        shaderStages[1].module = _fragmentShaders[(i&0x3) + 8];
+        name += " ";
+        name += fragmentShaderNameList[(i&0x3) + 8];
+        rasterizationState.cullMode =
+                (i&0x04)==0 ? vk::CullModeFlagBits::eNone :  // eNone - nothing is discarded,
+                vk::CullModeFlagBits::eBack;  // eBack - back-facing triangles are discarded, eFront - front-facing triangles are discarded
+        name +=( (i&0x04)==0 ? ", eNone" : ", eBack");
+        rasterizationState.frontFace =
+                (i&0x8) ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
+        name +=( (i&0x8)==0 ? ", eClockwise" : ", eCounterClockwise");
+        createInfo.layout =
+                (i&0x02) ? _texturePipelineLayout : _pipelineLayout;
+        _uberPipelines[i] =
+                _device->createGraphicsPipeline(
+                        pipelineCache,  // pipelineCache
+                        createInfo  // createInfo
+                );
+        _uberPipelines[i].name = name;
+    }
 
 	// create new line pipelines
 	inputAssemblyState.topology = vk::PrimitiveTopology::eLineList;
@@ -395,25 +479,63 @@ void PipelineLibrary::create(CadR::VulkanDevice& device, vk::Extent2D surfaceExt
 	rasterizationState.frontFace = vk::FrontFace::eCounterClockwise;  // frontFace does not matter for lines
 	static_assert((_numTrianglePipelines&0x7) == 0, "Number of triangle pipelines must be multiple of 8.");
 	for(size_t i=_numTrianglePipelines,e=i+_numLinePipelines; i<e; i++) {
-		shaderStages[0].module = _vertexShaders[i&0x7];
-		shaderStages[1].module = _fragmentShaders[i&0x7];
+        std::string name = "[" + std::to_string(i) + "]     Line ";
+        shaderStages[0].module = _vertexShaders[i&0x7];
+        name += vertexShaderNameList[i&0x7];
+        shaderStages[1].module = _fragmentShaders[i&0x7];
+        name += " ";
+        name += fragmentShaderNameList[i&0x7];
 		_pipelines[i] =
 			_device->createGraphicsPipeline(
 				pipelineCache,  // pipelineCache
 				createInfo  // createInfo
 			);
+        _pipelines[i].name = name;
 	}
+    for(size_t i=_numUberTrianglePipelines,e=i+_numUberLinePipelines; i<e; i++) {
+        std::string name = "[" + std::to_string(i) + "] UberLine ";
+        shaderStages[0].module = _vertexShaders[(i&0x3) + 4];
+        name += vertexShaderNameList[(i&0x3) + 4];
+        shaderStages[1].module = _fragmentShaders[(i&0x3) + 8];
+        name += " ";
+        name += fragmentShaderNameList[(i&0x3) + 8];
+        _uberPipelines[i] =
+                _device->createGraphicsPipeline(
+                        pipelineCache,  // pipelineCache
+                        createInfo  // createInfo
+                );
+        _uberPipelines[i].name = name;
+    }
 
 	// create new point pipelines
 	inputAssemblyState.topology = vk::PrimitiveTopology::ePointList;
 	static_assert((_numLinePipelines&0x7) == 0, "Number of line pipelines must be multiple of 8.");
 	for(size_t i=_numTrianglePipelines+_numLinePipelines,e=i+_numPointPipelines; i<e; i++) {
-		shaderStages[0].module = _pointVertexShaders[i&0x7];
-		shaderStages[1].module = _fragmentShaders[i&0x7];
+        std::string name = "[" + std::to_string(i) + "]     Point ";
+        shaderStages[0].module = _vertexShaders[i&0x7];
+        name += vertexShaderNameList[i&0x7];
+        shaderStages[1].module = _fragmentShaders[i&0x7];
+        name += " ";
+        name += fragmentShaderNameList[i&0x7];
 		_pipelines[i] =
 			_device->createGraphicsPipeline(
 				pipelineCache,  // pipelineCache
 				createInfo  // createInfo
 			);
+        _pipelines[i].name = name;
 	}
+    for(size_t i=_numUberTrianglePipelines+_numUberLinePipelines,e=i+_numUberPointPipelines; i<e; i++) {
+        std::string name = "[" + std::to_string(i) + "] UberPoint ";
+        shaderStages[0].module = _vertexShaders[(i&0x3) + 4];
+        name += vertexShaderNameList[(i&0x3) + 4];
+        shaderStages[1].module = _fragmentShaders[(i&0x3) + 8];
+        name += " ";
+        name += fragmentShaderNameList[(i&0x3) + 8];
+        _uberPipelines[i] =
+                _device->createGraphicsPipeline(
+                        pipelineCache,  // pipelineCache
+                        createInfo  // createInfo
+                );
+        _uberPipelines[i].name = name;
+    }
 }
