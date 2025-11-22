@@ -57,6 +57,13 @@ add_shader(UberShader.vert  -DID_BUFFER  shaders/UberShader-idBuffer.vert.spv  C
 add_shader(UberShader.geom  -DID_BUFFER  shaders/UberShader-idBuffer.geom.spv  CADPL_SHADER_DEPS)
 add_shader(UberShader.frag  -DID_BUFFER  shaders/UberShader-idBuffer.frag.spv  CADPL_SHADER_DEPS)
 
+add_custom_command(
+		OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp
+		COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/ShaderGenerator.cpp -DDST=${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp -P ${CMAKE_CURRENT_SOURCE_DIR}/generator_hash.cmake
+		DEPENDS ShaderGenerator.cpp
+)
+add_custom_target(generator_hash DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp)
+
 # CADR library
 add_library(${LIB_NAME}
 	${CADR_USER_DEFINED_DYNAMIC_OR_STATIC}
@@ -65,6 +72,7 @@ add_library(${LIB_NAME}
 	${CADPL_SOURCES}
 	${CADPL_SHADER_DEPS}
 	)
+add_dependencies(${LIB_NAME} generator_hash)
 
 # compile definitions
 if(WIN32)
