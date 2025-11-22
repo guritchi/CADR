@@ -2,6 +2,10 @@
 #include <CadPL/ShaderLibrary.h>
 #include <CadR/VulkanDevice.h>
 
+#include <shaderc/shaderc.hpp>
+
+#include <iostream>
+
 using namespace std;
 using namespace CadPL;
 
@@ -24,6 +28,52 @@ static const uint32_t fragmentUberShaderSpirv[]={
 static const uint32_t fragmentIdBufferUberShaderSpirv[]={
 #include "shaders/UberShader-idBuffer.frag.spv"
 };
+
+
+std::string compileToAssembly(const std::string& name,
+                              shaderc_shader_kind kind,
+                              const std::string& source,
+                              bool optimize)
+{
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions options;
+
+    if (optimize) {
+        options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    }
+
+    shaderc::AssemblyCompilationResult result = compiler.CompileGlslToSpvAssembly(
+            source, kind, name.c_str(), options);
+
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+        std::cerr << result.GetErrorMessage();
+        throw std::runtime_error("Can't compile file: " + std::string(name));
+    }
+
+    return {result.cbegin(), result.cend()};
+}
+
+shaderc::SpvCompilationResult compileToSpirV(const std::string& name,
+                                             shaderc_shader_kind kind,
+                                             const std::string& source,
+                                             bool optimize)
+{
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions options;
+
+    if (optimize) {
+        options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    }
+
+    shaderc::SpvCompilationResult module =
+            compiler.CompileGlslToSpv(source, kind, name.c_str(), options);
+
+    if (module.GetCompilationStatus() != shaderc_compilation_status_success) {
+        std::cerr << module.GetErrorMessage() << std::endl;
+        throw std::runtime_error("Can't compile shader: " + std::string(name));
+    }
+    return module;
+}
 
 
 

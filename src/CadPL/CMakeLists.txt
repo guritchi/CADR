@@ -42,6 +42,13 @@ source_group("Code" FILES ${CADPL_PUBLIC_HEADERS} ${CADPL_PRIVATE_HEADERS} ${CAD
 find_package(Vulkan REQUIRED)
 find_package(glm REQUIRED)
 
+# shaderc library
+option(SHADERC_SKIP_INSTALL "Skip installation" ON)
+option(SHADERC_SKIP_TESTS "Skip building tests" ON)
+option(SHADERC_SKIP_EXAMPLES "Skip building examples" ON)
+option(SHADERC_SKIP_EXECUTABLES  "Skip building executables." ON)
+add_subdirectory(../../3rdParty/shaderc shaderc_build)
+
 # shaders
 add_shader(UberShader.vert  ""  shaders/UberShader.vert.spv  CADPL_SHADER_DEPS)
 add_shader(UberShader.geom  ""  shaders/UberShader.geom.spv  CADPL_SHADER_DEPS)
@@ -90,7 +97,7 @@ set_target_properties(${LIB_NAME} PROPERTIES
 target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 # target libraries
-target_link_libraries(${LIB_NAME} Vulkan::Headers glm CadR)
+target_link_libraries(${LIB_NAME} Vulkan::Headers glm CadR shaderc_shared)
 
 # other target settings
 set_property(TARGET ${LIB_NAME} PROPERTY CXX_STANDARD 17)
