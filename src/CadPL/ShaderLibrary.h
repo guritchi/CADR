@@ -3,6 +3,8 @@
 #include <array>
 #include <bitset>
 #include <map>
+#include <sstream>
+#include <iomanip>
 #include <vulkan/vulkan.hpp>
 
 namespace CadR {
