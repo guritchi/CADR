@@ -146,6 +146,10 @@ public:
 
 	const ShaderState& shaderState() const;
 
+	size_t count() const noexcept;
+
+	vk::Pipeline createPipeline(const PipelineState& pipelineState);
+
 };
 
 
@@ -234,6 +238,7 @@ public:
 	vk::DescriptorSetLayout descriptorSetLayout() const;
 	const std::vector<vk::DescriptorSetLayout>& descriptorSetLayoutList() const;
 
+	size_t count() const noexcept;
 };
 
 
@@ -272,5 +277,8 @@ inline vk::PipelineCache PipelineLibrary::pipelineCache() const  { return _pipel
 inline vk::PipelineLayout PipelineLibrary::pipelineLayout() const  { return _shaderLibrary->pipelineLayout(); }
 inline vk::DescriptorSetLayout PipelineLibrary::descriptorSetLayout() const  { return _shaderLibrary->descriptorSetLayout(); }
 inline const std::vector<vk::DescriptorSetLayout>& PipelineLibrary::descriptorSetLayoutList() const  { return _shaderLibrary->descriptorSetLayoutList(); }
+
+inline size_t PipelineFamily::count() const noexcept { return _pipelineMap.size(); }
+inline size_t PipelineLibrary::count() const noexcept { size_t s = 0; for (const auto &p : _pipelineFamilyMap) s += p.second.count(); return s; }
 
 }

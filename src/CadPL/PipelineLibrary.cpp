@@ -1,6 +1,9 @@
 #include <CadPL/PipelineLibrary.h>
 #include <CadR/VulkanDevice.h>
 
+#include <iostream>
+#include <chrono>
+
 using namespace std;
 using namespace CadPL;
 
@@ -90,6 +93,8 @@ SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipeline
 
 SharedPipeline PipelineLibrary::getOrCreatePipeline(const ShaderState& shaderState, const PipelineState& pipelineState)
 {
+    bool newPipeline = false;
+    auto start = std::chrono::system_clock::now();
 	auto [it, newRecord] = _pipelineFamilyMap.try_emplace(shaderState, *this);
 	if(newRecord) {
 		try {
@@ -102,8 +107,14 @@ SharedPipeline PipelineLibrary::getOrCreatePipeline(const ShaderState& shaderSta
 		}
 		it->second._mapIterator = it;
 		it->second._primitiveTopology = shaderState.primitiveTopology;
+        newPipeline = !it->second.getPipeline(pipelineState).cadrPipeline();
 	}
-	return it->second.getOrCreatePipeline(pipelineState);
+	auto p = it->second.getOrCreatePipeline(pipelineState);
+    if (newPipeline) {
+        const auto end = std::chrono::system_clock::now();
+        std::cout << "new pipeline creation: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+    }
+    return p;
 }
 
 
@@ -223,7 +234,7 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 			"main",  // pName
 			nullptr,  // pSpecializationInfo
 		};
-	if(pipelineFamily._geometryShader) {
+	if(pipelineFamily._geometryShader && pipelineFamily._geometryShader.get()) {
 		shaderStages[2] =
 			vk::PipelineShaderStageCreateInfo{
 				vk::PipelineShaderStageCreateFlags(),  // flags

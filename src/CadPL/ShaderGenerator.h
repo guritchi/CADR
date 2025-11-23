@@ -14,7 +14,7 @@ struct ShaderState;
 
 class CADPL_EXPORT ShaderGenerator {
 public:
-    static void initializeCache();
+	static void initializeCache();
 
 	[[nodiscard]] static vk::ShaderModule createVertexShader(const ShaderState& state, CadR::VulkanDevice& device);
 	[[nodiscard]] static vk::ShaderModule createGeometryShader(const ShaderState& state, CadR::VulkanDevice& device);

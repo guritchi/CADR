@@ -59,6 +59,9 @@ protected:
 
 public:
 
+	// user data
+	std::vector<uint8_t> pushConstantData;
+
 	// pipeline to bind
 	const CadR::Pipeline* pipeline = nullptr;
 

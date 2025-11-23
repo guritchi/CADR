@@ -244,6 +244,17 @@ void StateSet::recordToCommandBuffer(vk::CommandBuffer commandBuffer, vk::Pipeli
 			}.data()
 		);
 
+		if (!pushConstantData.empty()) {
+			device.cmdPushConstants(
+			        commandBuffer,  // commandBuffer
+			        currentPipelineLayout,  // pipelineLayout
+			        vk::ShaderStageFlagBits::eAllGraphics,
+			        16,  // offset
+			        pushConstantData.size(),  // size
+					pushConstantData.data() // pValues
+			);
+		}
+
 		// draw command
 		device.cmdDrawIndirect(
 			commandBuffer,  // commandBuffer

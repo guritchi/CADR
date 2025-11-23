@@ -3,8 +3,6 @@
 #include <array>
 #include <bitset>
 #include <map>
-#include <sstream>
-#include <iomanip>
 #include <vulkan/vulkan.hpp>
 
 namespace CadR {
@@ -13,6 +11,60 @@ class VulkanDevice;
 
 namespace CadPL {
 
+enum class AttributeType : uint16_t
+{
+    undefined = 0,
+    vec4align16 = 0x01,
+
+    vec3align16 = 0x20,
+    vec3align4 = 0x21,
+    //   - 0x22 - half3, alignment 4, on 8 bytes reads first six bytes
+    //   - 0x23 - half3, alignment 4, on 8 bytes reads last six bytes
+    //   - 0x24 - uint3, alignment 16, normalize
+    //   - 0x25 - uint3, alignment 16
+    //   - 0x26 - uint3, alignment 4, normalize
+    //   - 0x27 - uint3, alignment 4
+    //   - 0x28 - int3, alignment 16, normalize
+    //   - 0x29 - int3, alignment 16
+    //   - 0x2a - int3, alignment 4, normalize
+    //   - 0x2b - int3, alignment 4
+    //   - 0x2c - ushort3, alignment 4, on 8 bytes reads first six bytes, normalize
+    //   - 0x2d - ushort3, alignment 4, on 8 bytes reads first six bytes
+    //   - 0x2e - ushort3, alignment 4, on 8 bytes reads last six bytes, normalize
+    //   - 0x2f - ushort3, alignment 4, on 8 bytes reads last six bytes
+    //   - 0x30 - short3, alignment 4, on 8 bytes reads first six bytes, normalize
+    //   - 0x31 - short3, alignment 4, on 8 bytes reads first six bytes
+    //   - 0x32 - short3, alignment 4, on 8 bytes reads last six bytes, normalize
+    //   - 0x33 - short3, alignment 4, on 8 bytes reads last six bytes
+    //   - 0x34 - ubyte3, alignment 4, on 4 bytes extracts first three bytes, normalize
+    //   - 0x35 - ubyte3, alignment 4, on 4 bytes extracts first three bytes
+    //   - 0x36 - ubyte3, alignment 4, on 4 bytes extracts last three bytes, normalize
+    //   - 0x37 - ubyte3, alignment 4, on 4 bytes extracts last three bytes
+    //   - 0x38 - ubyte3, alignment 4, on 4 bytes extracts first three bytes, reads the values with additional offset +2, normalize
+    //   - 0x39 - ubyte3, alignment 4, on 4 bytes extracts first three bytes, reads the values with additional offset +2
+    //   - 0x3a - ubyte3, alignment 4, on 4 bytes extracts last three bytes, reads the values with additional offset +2, normalize
+    //   - 0x3b - ubyte3, alignment 4, on 4 bytes extracts last three bytes, reads the values with additional offset +2
+    //   - 0x3c - byte3, alignment 4, on 4 bytes extracts first three bytes, normalize
+    //   - 0x3d - byte3, alignment 4, on 4 bytes extracts first three bytes
+    //   - 0x3e - byte3, alignment 4, on 4 bytes extracts last three bytes, normalize
+    //   - 0x3f - byte3, alignment 4, on 4 bytes extracts last three bytes
+    //   - 0x40 - byte3, alignment 4, on 4 bytes extracts first three bytes, reads the values with additional offset +2, normalize
+    //   - 0x41 - byte3, alignment 4, on 4 bytes extracts first three bytes, reads the values with additional offset +2
+    //   - 0x42 - byte3, alignment 4, on 4 bytes extracts last three bytes, reads the values with additional offset +2, normalize
+    //   - 0x43 - byte3, alignment 4, on 4 bytes extracts last three bytes, reads the values with additional offset +2
+    vec2align8 = 0x50,
+    vec2align4 = 0x51,
+};
+
+enum class TextureType
+{
+	none = 0,
+	normal,
+	occlusion,
+	emissive,
+	base,
+	metallicRoughness
+};
 
 struct CADPL_EXPORT ShaderState {
 
@@ -25,9 +77,9 @@ struct CADPL_EXPORT ShaderState {
 	std::array<uint16_t,maxNumAttribs> attribAccessInfo;
 	uint32_t attribSetup;
 	uint32_t materialSetup;
-	uint16_t lightSetup[4];
+	std::array<uint16_t, 4> lightSetup;
 	uint16_t numLights;
-	uint32_t textureSetup[6];
+	std::array<uint32_t, 6> textureSetup;
 	uint16_t numTextures;
 
 	static constexpr const unsigned numOptimizeFlags = 7;
@@ -47,6 +99,9 @@ struct CADPL_EXPORT ShaderState {
 	std::bitset<numOptimizeFlags> optimizeFlags = OptimizeNone;
 
 	bool operator<(const ShaderState& rhs) const;
+
+	std::string serialize() const;
+	std::string debugDump() const;
 
 };
 
@@ -92,21 +147,38 @@ protected:
 		typename std::map<MapKey,ShaderModuleObject<MapKey>>::iterator eraseIt;  //< Iterator for removing this object from the map when the referenceCounter reaches zero.
 	};
 
+	// important: modifications to ShaderState must propagate here
 	struct VertexShaderMapKey {
-		bool idBuffer;
+		std::bitset<ShaderState::numOptimizeFlags> optimizeFlags;
+		std::array<uint16_t, ShaderState::maxNumAttribs> attribAccessInfo;
+		vk::PrimitiveTopology primitiveTopology;
 		ShaderState::ProjectionHandling projectionHandling;
+		bool idBuffer;
+
 		VertexShaderMapKey(const ShaderState& shaderState);
 		bool operator<(const VertexShaderMapKey& rhs) const;
 	};
 	struct GeometryShaderMapKey {
+		std::bitset<ShaderState::numOptimizeFlags> optimizeFlags;
+		std::array<uint16_t, ShaderState::maxNumAttribs> attribAccessInfo;
+		vk::PrimitiveTopology primitiveTopology;
+		ShaderState::ProjectionHandling projectionHandling;
 		bool idBuffer;
+
 		GeometryShaderMapKey(const ShaderState& shaderState);
-		bool operator<(const GeometryShaderMapKey& rhs) const  { return idBuffer < rhs.idBuffer; }
+		bool operator<(const GeometryShaderMapKey& rhs) const;
 	};
 	struct FragmentShaderMapKey {
+		std::bitset<ShaderState::numOptimizeFlags> optimizeFlags;
+		uint32_t materialSetup;
+		std::array<uint16_t, ShaderState::maxNumAttribs> attribAccessInfo;
+		std::array<uint32_t, 6> textureSetup;
+		std::array<uint16_t, 4> lightSetup;
+		vk::PrimitiveTopology primitiveTopology;
 		bool idBuffer;
+
 		FragmentShaderMapKey(const ShaderState& shaderState);
-		bool operator<(const FragmentShaderMapKey& rhs) const  { return idBuffer < rhs.idBuffer; }
+		bool operator<(const FragmentShaderMapKey& rhs) const;
 	};
 
 	std::map<VertexShaderMapKey, ShaderModuleObject<VertexShaderMapKey>> _vertexShaderMap;
@@ -144,6 +216,11 @@ public:
 	vk::DescriptorSetLayout descriptorSetLayout() const;
 	const std::vector<vk::DescriptorSetLayout>& descriptorSetLayoutList() const;
 
+	size_t count() const noexcept;
+	size_t countVertex() const noexcept;
+	size_t countGeometry() const noexcept;
+	size_t countFragment() const noexcept;	
+
 };
 
 
@@ -159,10 +236,9 @@ inline SharedShaderModule::operator vk::ShaderModule() const  { return static_ca
 inline SharedShaderModule::operator bool() const  { return _smObject; }
 inline void SharedShaderModule::reset() noexcept  { if(!_smObject) return; ShaderLibrary::unrefShaderModule(_smObject); _smObject=nullptr; }
 
-inline ShaderLibrary::VertexShaderMapKey::VertexShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer), projectionHandling(shaderState.projectionHandling) {}
-inline ShaderLibrary::GeometryShaderMapKey::GeometryShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer) {}
-inline ShaderLibrary::FragmentShaderMapKey::FragmentShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer) {}
-inline bool ShaderLibrary::VertexShaderMapKey::operator<(const ShaderLibrary::VertexShaderMapKey& rhs) const  { if(idBuffer < rhs.idBuffer) return true; if(idBuffer > rhs.idBuffer) return false; return projectionHandling < rhs.projectionHandling; }
+inline ShaderLibrary::VertexShaderMapKey::VertexShaderMapKey(const ShaderState& shaderState)  : optimizeFlags(shaderState.optimizeFlags), attribAccessInfo(shaderState.attribAccessInfo), primitiveTopology(shaderState.primitiveTopology), idBuffer(shaderState.idBuffer), projectionHandling(shaderState.projectionHandling) {}
+inline ShaderLibrary::GeometryShaderMapKey::GeometryShaderMapKey(const ShaderState& shaderState)  : optimizeFlags(shaderState.optimizeFlags), attribAccessInfo(shaderState.attribAccessInfo), primitiveTopology(shaderState.primitiveTopology), idBuffer(shaderState.idBuffer), projectionHandling(shaderState.projectionHandling) {}
+inline ShaderLibrary::FragmentShaderMapKey::FragmentShaderMapKey(const ShaderState& shaderState)  : optimizeFlags(shaderState.optimizeFlags), materialSetup(shaderState.materialSetup), textureSetup(shaderState.textureSetup), lightSetup(shaderState.lightSetup), attribAccessInfo(shaderState.attribAccessInfo), primitiveTopology(shaderState.primitiveTopology), idBuffer(shaderState.idBuffer) {}
 inline void ShaderLibrary::refShaderModule(void* shaderModuleObject) noexcept  { auto* smObject=static_cast<ShaderLibrary::AbstractShaderModuleObject*>(shaderModuleObject); smObject->referenceCounter++; }
 inline void ShaderLibrary::unrefShaderModule(void* shaderModuleObject) noexcept  { auto* smObject=static_cast<ShaderLibrary::AbstractShaderModuleObject*>(shaderModuleObject); if(smObject->referenceCounter==1) ShaderLibrary::destroyShaderModule(smObject); else smObject->referenceCounter--; }
 inline SharedShaderModule ShaderLibrary::getVertexShader(const ShaderState& state)  { auto it=_vertexShaderMap.find(state); return (it!=_vertexShaderMap.end()) ? SharedShaderModule(&it->second) : SharedShaderModule(); }
@@ -173,4 +249,8 @@ inline vk::PipelineLayout ShaderLibrary::pipelineLayout() const  { return _pipel
 inline vk::DescriptorSetLayout ShaderLibrary::descriptorSetLayout() const  { return _descriptorSetLayout; }
 inline const std::vector<vk::DescriptorSetLayout>& ShaderLibrary::descriptorSetLayoutList() const  { return _descriptorSetLayoutList; }
 
+inline size_t ShaderLibrary::count() const noexcept { return _vertexShaderMap.size() + _geometryShaderMap.size() + _fragmentShaderMap.size(); }
+inline size_t ShaderLibrary::countVertex() const noexcept { return _vertexShaderMap.size(); }
+inline size_t ShaderLibrary::countGeometry() const noexcept { return _geometryShaderMap.size(); }
+inline size_t ShaderLibrary::countFragment() const noexcept { return _fragmentShaderMap.size(); }
 }

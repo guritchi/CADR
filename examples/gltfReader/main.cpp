@@ -24,6 +24,21 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <nlohmann/json.hpp>
 #include "../../3rdParty/stb/stb_image.h"
+#include "imgui.h"
+#include "backends/imgui_impl_sdl2.h"
+#include "backends/imgui_impl_vulkan.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_sdl2.h"
+#include "backends/imgui_impl_sdl3.h"
+#if defined(USE_PLATFORM_WIN32)
+#include "backends/imgui_impl_win32.h"
+#elif defined(USE_PLATFORM_SDL3)
+#include "backends/imgui_impl_sdl3.h"
+#elif defined(USE_PLATFORM_SDL2)
+#include "backends/imgui_impl_sdl2.h"
+#elif defined(USE_PLATFORM_GLFW)
+#include "backends/imgui_impl_glfw.h"
+#endif
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -39,12 +54,29 @@
 # include <shellapi.h>  // needed for CommandLineToArgvW()
 #endif
 
+#include <CadPL/ShaderLibrary.h>
+#include <CadPL/PipelineLibrary.h>
+#include <CadPL/ShaderGenerator.h>
+
 using namespace std;
 
 using json = nlohmann::json;
 
 typedef logic_error GltfError;
 
+// static constexpr uint32_t NumDescriptorsStreaming  = 2048;
+// static constexpr uint32_t NumDescriptorsNonUniform = 1024;
+
+static const auto OptimizeLevels = std::array{
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeNone).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeAttribs).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeTextures).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeMaterial).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeTextures | CadPL::ShaderState::OptimizeMaterial).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeAttribs | CadPL::ShaderState::OptimizeMaterial).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeAttribs | CadPL::ShaderState::OptimizeTextures).to_ullong()),
+	static_cast<uint32_t>((CadPL::ShaderState::OptimizeAttribs | CadPL::ShaderState::OptimizeTextures | CadPL::ShaderState::OptimizeMaterial).to_ullong()),
+};
 
 // Shader data structures
 struct OpenGLLightGpuData {
@@ -82,7 +114,7 @@ struct LightGpuData {
 static constexpr const size_t lightGpuDataSize = 128;
 static_assert(sizeof(LightGpuData) == lightGpuDataSize, "Wrong LightGpuData data size");
 
-constexpr const uint32_t maxLights = 1;
+constexpr const uint32_t maxLights = 4;
 struct SceneGpuData {
 	glm::mat4 viewMatrix;    // current camera view matrix
 	glm::mat4 projectionMatrix;  // current camera view matrix
@@ -94,6 +126,60 @@ struct SceneGpuData {
 };
 static_assert(sizeof(SceneGpuData) == 192+(lightGpuDataSize*maxLights), "Wrong SceneGpuData data size");
 
+class MedianCounter {
+    static constexpr unsigned BUFFER_SIZE = 1024;
+
+	std::array<double, BUFFER_SIZE> _counters = {};
+	unsigned _current = 0;
+
+public:
+
+    bool update(double value) {
+        _counters[_current] = value;
+        _current = (_current+1) % BUFFER_SIZE;
+    	return _current == 0;
+    }
+
+    double get() const {
+    	auto values = _counters;
+    	std::nth_element(values.begin(), values.begin() + BUFFER_SIZE / 2, values.end());
+    	if constexpr (BUFFER_SIZE % 2 == 0) {
+    		return std::midpoint(values[BUFFER_SIZE / 2], values[BUFFER_SIZE / 2 + 1]);
+    	}
+    	else {
+    		return values[BUFFER_SIZE / 2];
+    	}
+    }
+
+};
+
+
+static void printStateSet(const CadR::StateSet &set, int indent = 0) {
+
+    for (int i = 0; i < indent; ++i) {
+        std::cout << "  ";
+    }
+
+    const auto &descriptors = set.descriptorSetList();
+    std::cout << &set << ": " << set.getNumDrawables() << " drawables, pipeline: ";
+    if (!set.pipeline) {
+        std::cout << "null";
+    }
+    else {
+        std::cout << set.pipeline->get() << ", layout: " << set.pipeline->layout();
+    }
+    if (!descriptors.empty()) {
+        std::cout << ", " << descriptors.size() << " descriptors";
+    }
+	if (!set.childList.empty()) {
+		std::cout << ", " << set.childList.size() << " children";
+	}
+    std::cout << "\n";
+    indent++;
+    for (const auto &c : set.childList) {
+        printStateSet(c, indent);
+    }
+}
 
 // application class
 class App {
@@ -145,8 +231,16 @@ public:
 	vk::Fence renderingFinishedFence;
 
 	CadR::Renderer renderer;
+	std::unique_ptr<CadPL::ShaderLibrary> shaderLibrary;
+	std::unique_ptr<CadPL::PipelineLibrary> pipelineLibrary;
 	vk::CommandPool commandPool;
 	vk::CommandBuffer commandBuffer;
+
+	vk::PipelineCache imguiPipelineCache;
+	vk::DescriptorPool imguiDescriptorPool;
+	bool imguiPanel = true;
+	std::string guiFrameTime;
+
 
 	// camera control
 	static constexpr const float maxZNearZFarRatio = 1000.f;  //< Maximum z-near distance and z-far distance ratio. High ratio might lead to low z-buffer precision.
@@ -159,12 +253,78 @@ public:
 	float startCameraHeading, startCameraElevation;
 	CadR::BoundingSphere sceneBoundingSphere;
 
+	bool newCamera = true;
+	glm::vec3 cameraEye;
+	glm::vec3 cameraDirection;
+	glm::vec3 cameraUp;
+	glm::vec3 cameraRight;
+	glm::vec2 cameraAngles;
+	float prevMouseX, prevMouseY;
+	float cameraSpeed = 10.f;
+	float cameraSensitivity = 0.01f;
+
 	filesystem::path filePath;
 	string utf8FilePath;  // File path stored as utf-8. MSVC has problems to convert some characters from utf-16 to utf-8. So we keep the extra string. See comment for utf16toUtf8() for more info.
 	string utf8FileName;  // File name as utf-8. No parent directories and no file name suffix. MSVC has problems to convert some characters from utf-16 to utf-8. So we keep the extra string. See comment for utf16toUtf8() for more info.
 
 	CadR::HandlelessAllocation sceneDataAllocation;
 	CadR::StateSet stateSetRoot;
+	CadR::StateSet stateSetDrawables;
+	CadR::StateSet stateSetGUI;
+	struct TextureStateSet {
+		CadR::StateSet stateSet;
+		CadR::Texture* texture;
+	};
+	struct PipelineStateSet {
+		CadPL::SharedPipeline pipeline;
+		CadR::StateSet stateSet;
+		bool compile = false;
+
+		PipelineStateSet(CadR::Renderer& r) noexcept  : stateSet(r) {}
+        void destroy() noexcept  { stateSet.destroy(); pipeline.reset(); }
+	};
+
+	struct TextureSetup {
+		uint32_t settings = {};
+		size_t index = ~size_t(0);
+
+		operator bool() const {
+			return index != ~size_t(0);
+		}
+	};
+
+    struct PipelineDescriptor {
+        uint32_t optimizeFlags = {};
+        uint32_t materialSettings = {};
+        uint32_t attibSetup = {};
+        std::array<uint16_t, 16> attribInfo = {};
+        std::array<uint32_t, 6> textureInfo = {};
+        uint8_t numAttributes = {};
+        uint8_t numTextures = {};
+        // TODO lights
+        vk::CullModeFlagBits cullMode = {};
+        vk::FrontFace frontFace = {};
+        vk::PrimitiveTopology primitiveTopology = {};
+
+        auto operator<=>(const PipelineDescriptor&) const = default;
+    };
+	struct UberPipelineDescriptor {
+		vk::CullModeFlagBits cullMode = {};
+		vk::FrontFace frontFace = {};
+		vk::PrimitiveTopology primitiveTopology = {};
+
+		UberPipelineDescriptor();
+		explicit UberPipelineDescriptor(const PipelineDescriptor &desc)
+			: cullMode(desc.cullMode)
+			, frontFace(desc.frontFace)
+			, primitiveTopology(desc.primitiveTopology)
+		{}
+
+		auto operator<=>(const UberPipelineDescriptor&) const = default;
+	};
+
+    std::map<PipelineDescriptor, PipelineStateSet> pipelineStateSets;
+	std::map<UberPipelineDescriptor, PipelineStateSet> uberPipelineStateSets;
 	CadPL::PipelineSceneGraph pipelineSceneGraph;
 	CadR::Pipeline layoutOnlyPipeline;
 	vector<CadR::Geometry> geometryList;
@@ -176,6 +336,331 @@ public:
 	vector<CadR::Texture> textureList;
 	CadR::Sampler defaultSampler;
 	CadR::DataAllocation defaultMaterial;
+
+	uint32_t optimizeFlags = *OptimizeLevels.rbegin();
+
+    CadPL::PipelineState getPipelineState(
+            vk::RenderPass renderPass,
+            vk::Extent2D surfaceExtent,
+            vk::FrontFace frontFace,
+            vk::CullModeFlagBits cullMode)
+    const {
+
+        CadPL::PipelineState pipelineState{
+        	.viewportAndScissorHandling = CadPL::PipelineState::ViewportAndScissorHandling::SetFunction,
+        	.projectionIndex = 0,
+			.viewportIndex = 0,
+			.scissorIndex = 0,
+            .viewport = vk::Viewport(0.f, 0.f, float(surfaceExtent.width), float(surfaceExtent.height), 0.f, 1.f),
+            .scissor = vk::Rect2D(vk::Offset2D(0, 0), surfaceExtent),
+            .cullMode = cullMode,
+            .frontFace = frontFace,
+        	.depthBiasDynamicState = false,
+			.depthBiasEnable = false,
+			.depthBiasConstantFactor = 0.f,
+			.depthBiasClamp = 0.f,
+			.depthBiasSlopeFactor = 0.f,
+			.lineWidthDynamicState = false,
+			.lineWidth = 1.f,
+			.rasterizationSamples = vk::SampleCountFlagBits::e1,
+			.sampleShadingEnable = false,
+			.minSampleShading = 0.f,
+			.depthTestEnable = true,
+			.depthWriteEnable = true,
+			.blendState = { { .blendEnable = false } },
+			.renderPass = renderPass,
+			.subpass = 0,
+        };
+
+        // pipelineState.blendState.emplace_back(
+        //     VK_FALSE, // blendEnable
+        //     vk::BlendFactor::eZero,  // srcColorBlendFactor
+        //     vk::BlendFactor::eZero,  // dstColorBlendFactor
+        //     vk::BlendOp::eAdd,	     // colorBlendOp
+        //     vk::BlendFactor::eZero,  // srcAlphaBlendFactor
+        //     vk::BlendFactor::eZero,  // dstAlphaBlendFactor
+        //     vk::BlendOp::eAdd,	     // alphaBlendOp
+        //     vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        //     vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA  // colorWriteMask
+        // );
+        return pipelineState;
+    }
+
+	PipelineStateSet& getPipelineStateSet(
+		uint32_t optimizeFlags,
+		vk::PrimitiveTopology primitiveTopology,
+		vk::CullModeFlagBits cullMode,
+		vk::FrontFace frontFace,
+		uint32_t materialSettings,
+		uint32_t attibSetup,
+		const decltype(PipelineDescriptor::attribInfo) &attribInfo,
+		const std::span<TextureSetup> textureSetup
+	) {
+
+		PipelineDescriptor desc{
+			.optimizeFlags = optimizeFlags,
+			.cullMode = cullMode,
+			.frontFace = frontFace,
+			.primitiveTopology = primitiveTopology
+		};
+
+		if (optimizeFlags & CadPL::ShaderState::OptimizeMaterial.to_ulong()) {
+			desc.materialSettings = materialSettings;
+		}
+
+		if (optimizeFlags & CadPL::ShaderState::OptimizeAttribs.to_ulong()) {
+			uint8_t numAttributes = 0;
+			uint8_t numTextureAttributes = 0;
+			for (int i = 0; i < attribInfo.size(); ++i) {
+				if (attribInfo[i]) {
+					numAttributes++;
+					if (i >= 4) {
+						numTextureAttributes++;
+					}
+				}
+			}
+			desc.attribInfo = attribInfo;
+			desc.numAttributes = numAttributes;
+			desc.attibSetup = attibSetup;
+
+			if (numTextureAttributes == 0) {
+				desc.numTextures = 0;
+				desc.optimizeFlags |= CadPL::ShaderState::OptimizeTextures.to_ulong();
+			}
+		}
+
+		if (optimizeFlags & CadPL::ShaderState::OptimizeTextures.to_ulong()) {
+			uint8_t numTextures = 0;
+			for (int i = 0; i < textureSetup.size(); ++i) {
+				if (textureSetup[i]) {
+					// std::cout << "  Add texture: " << std::hex << textureSetup[i].settings << std::dec << "\n";
+					desc.textureInfo[numTextures] = textureSetup[i].settings;
+					numTextures++;
+				}
+			}
+			desc.numTextures = numTextures;
+		}
+
+    	const bool none = optimizeFlags == static_cast<uint32_t>(CadPL::ShaderState::OptimizeNone.to_ullong());
+    	const bool full = optimizeFlags == static_cast<uint32_t>((
+			CadPL::ShaderState::OptimizeAttribs
+			| CadPL::ShaderState::OptimizeTextures
+			| CadPL::ShaderState::OptimizeMaterial
+			).to_ullong());
+
+    	auto &uberSet = getUberPipelineStateSet(UberPipelineDescriptor(desc));
+
+		if (none) {
+			desc.materialSettings = materialSettings;
+
+			uint8_t numAttributes = 0;
+			for (int i = 0; i < attribInfo.size(); ++i) {
+				if (attribInfo[i]) {
+					numAttributes++;
+				}
+			}
+			desc.attribInfo = attribInfo;
+			desc.numAttributes = numAttributes;
+			desc.attibSetup = attibSetup;
+
+			uint8_t numTextures = 0;
+			for (int i = 0; i < textureSetup.size(); ++i) {
+				if (textureSetup[i]) {
+					// std::cout << "  Add texture: " << std::hex << textureSetup[i].settings << std::dec << "\n";
+					desc.textureInfo[numTextures] = textureSetup[i].settings;
+					numTextures++;
+				}
+			}
+			desc.numTextures = numTextures;
+		}
+
+    	CadR::StateSet *parent = {};
+    	CadR::StateSet *target = {};
+    	auto [it, newRecord] = pipelineStateSets.try_emplace(desc, renderer);
+    	if (!full && !none) {
+    		parent = &it->second.stateSet;
+			if (newRecord) {
+				it->second.compile = true;
+				uberSet.stateSet.childList.append(*parent);
+			}
+    		desc.materialSettings = materialSettings;
+
+    		uint8_t numAttributes = 0;
+    		for (int i = 0; i < attribInfo.size(); ++i) {
+    			if (attribInfo[i]) {
+    				numAttributes++;
+    			}
+    		}
+    		desc.attribInfo = attribInfo;
+    		desc.numAttributes = numAttributes;
+    		desc.attibSetup = attibSetup;
+
+    		uint8_t numTextures = 0;
+    		for (int i = 0; i < textureSetup.size(); ++i) {
+    			if (textureSetup[i]) {
+    				// std::cout << "  Add texture: " << std::hex << textureSetup[i].settings << std::dec << "\n";
+    				desc.textureInfo[numTextures] = textureSetup[i].settings;
+    				numTextures++;
+    			}
+    		}
+    		desc.numTextures = numTextures;
+
+    		std::tie(it, newRecord) = pipelineStateSets.try_emplace(desc, renderer);
+    		target = &it->second.stateSet;
+    		if (newRecord) {
+    			parent->childList.append(*target);
+    		}
+    	} else {
+			target = &it->second.stateSet;
+			if (newRecord) {
+				it->second.compile = !none;
+				uberSet.stateSet.childList.append(*target);
+			}
+		}
+
+		if(newRecord) {
+			CadR::StateSet& s = it->second.stateSet;
+			constexpr auto size = sizeof(desc.materialSettings) + sizeof(desc.attibSetup) + sizeof(desc.attribInfo);
+			s.pushConstantData.resize(size);
+			uint8_t *data = s.pushConstantData.data();
+			*reinterpret_cast<decltype(desc.attribInfo)*>(data) = attribInfo;
+			data += sizeof(attribInfo);
+			*reinterpret_cast<decltype(desc.attibSetup)*>(data) = attibSetup;
+			data += sizeof(attibSetup);
+			*reinterpret_cast<decltype(desc.materialSettings)*>(data) = materialSettings;
+			// data += sizeof(materialSettings);
+		}
+		return it->second;
+	}
+
+	PipelineStateSet& getUberPipelineStateSet(const UberPipelineDescriptor &desc) {
+    	auto [it, newRecord] = uberPipelineStateSets.try_emplace(desc, renderer);
+    	if(newRecord) {
+    		CadR::StateSet& s = it->second.stateSet;
+    		it->second.compile = true;
+    		stateSetDrawables.childList.append(s);
+    	}
+    	return it->second;
+    }
+
+	void setPipelines() {
+    	for(auto &pss : uberPipelineStateSets) {
+    		auto &set = pss.second;
+    		const auto &desc = pss.first;
+
+    		CadPL::ShaderState shaderState{
+    			.idBuffer = false,
+    			.primitiveTopology = desc.primitiveTopology,
+    			.projectionHandling = CadPL::ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants,
+    			.lightSetup = {},  // no lights; switches between directional light, point light and spotlight
+				.numLights = {},
+				.textureSetup = {},  // no textures
+				.numTextures = {},
+				.optimizeFlags = CadPL::ShaderState::OptimizeNone,
+			};
+
+    		const auto pipelineState = getPipelineState(
+				renderPass,
+				window.surfaceExtent(),
+				desc.frontFace,
+				desc.cullMode
+			);
+
+    		std::cout << "PipelineStateSet (uber)" << &pss.second << "  " << shaderState.serialize() << "\n" << shaderState.debugDump() << "\n";
+    		std::cout << "  cullMode: " << vk::to_string(desc.cullMode) << "\n";
+    		std::cout << "  frontFace: " << vk::to_string(desc.frontFace) << "\n";
+    		std::cout << "  primitiveTopology: " << vk::to_string(desc.primitiveTopology) << "\n";
+
+    		if (!set.pipeline.cadrPipeline()) {
+    			set.pipeline = pipelineLibrary->getOrCreatePipeline(shaderState, pipelineState);;
+    			auto *ptr = set.pipeline.cadrPipeline();
+    			assert(ptr && ptr->get() && "pipeline was not compiled");
+    			set.stateSet.pipeline = ptr;
+    		}
+    	}
+
+        for(auto &pss : pipelineStateSets) {
+            const auto &d = pss.first;
+            auto &set = pss.second;
+
+            CadPL::ShaderState shaderState{
+				.idBuffer = false,
+				.primitiveTopology = d.primitiveTopology,
+				.projectionHandling = CadPL::ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants,
+				.lightSetup = {},  // no lights; switches between directional light, point light and spotlight
+				.numLights = {},
+				.textureSetup = {},  // no textures
+				.numTextures = {},
+				.optimizeFlags = CadPL::ShaderState::OptimizeNone,
+            };
+
+            const auto pipelineState = getPipelineState(
+                renderPass,
+                window.surfaceExtent(),
+                d.frontFace,
+                d.cullMode
+            );
+
+        	// if (!useUberShader) {
+        		shaderState.optimizeFlags = d.optimizeFlags;
+        		shaderState.attribAccessInfo = d.attribInfo;
+        		shaderState.attribSetup = d.attibSetup;
+        		shaderState.textureSetup = d.textureInfo;
+        		shaderState.numTextures = d.numTextures;
+        		shaderState.materialSetup = d.materialSettings;
+        		// uint16_t lightSetup[4];
+        	// }
+
+        	if (!set.compile) {
+        		std::cout << "(nocompile) PipelineStateSet " << &pss.second.stateSet << "  " << shaderState.serialize() << "\n" << shaderState.debugDump() << "\n";
+        		continue;
+        	}
+			std::cout << "PipelineStateSet " << &pss.second.stateSet << "  " << shaderState.serialize() << "\n" << shaderState.debugDump() << "\n";
+        	std::cout << "  vertexSize: " << (d.attibSetup & 0x01fc) << "\n";
+        	std::cout << "  cullMode: " << vk::to_string(d.cullMode) << "\n";
+        	std::cout << "  frontFace: " << vk::to_string(d.frontFace) << "\n";
+        	std::cout << "  primitiveTopology: " << vk::to_string(d.primitiveTopology) << "\n";
+        	if (d.attibSetup & 1) {
+        		std::cout << "  generateFlatNormals\n";
+        	}
+
+
+        	if(useUberShader) {
+        		set.stateSet.pipeline = {};
+        	}
+        	else {
+        		if (!set.pipeline.cadrPipeline()) {
+					set.pipeline = pipelineLibrary->getOrCreatePipeline(shaderState, pipelineState);
+				}
+        		set.stateSet.pipeline = set.pipeline.cadrPipeline();
+        	}
+
+        }
+
+    	std::cout << "=== stats: " << uberPipelineStateSets.size() + pipelineStateSets.size() << " stateSets, " << pipelineLibrary->count() << " pipelines, " << shaderLibrary->count() << " shaderModules (" << shaderLibrary->countVertex() << "V, " << shaderLibrary->countGeometry() << "G, " << shaderLibrary->countFragment() << "F)\n";
+        printStateSet(stateSetRoot);
+    }
+
+	PFN_vkVoidFunction imguiLoadFunction(const char *name) const {
+	    auto func = device.getProcAddr(name);
+    	if (func) {
+    		return func;
+    	}
+    	return vulkanInstance.getProcAddr(name);
+    }
+
+    bool calibratedTimestampsSupported = false;
+	bool useUberShader = false;
+	bool noPause = true;
+    std::chrono::steady_clock::time_point lastDebugTime;
+    MedianCounter gpuTimeCounter;
+    MedianCounter cpuTimeCounter;
+
+private:
+
+	void setCamera(glm::vec3 position, glm::vec3 target, glm::vec3 up);
+
+	void renderGUI();
 
 };
 
@@ -268,6 +753,8 @@ static string utf16ToUtf8(const wchar_t* ws)
 App::App(int argc, char** argv)
 	: sceneDataAllocation(renderer.dataStorage())
 	, stateSetRoot(renderer)
+	, stateSetDrawables(renderer)
+	, stateSetGUI(renderer)
 	, defaultSampler(renderer)
 	, defaultMaterial(renderer.dataStorage(), CadR::DataAllocation::noHandle)
 {
@@ -293,6 +780,15 @@ App::App(int argc, char** argv)
 	filePath = utf8FilePath;
 	utf8FileName = filePath.filename();
 #endif
+	if(argc > 2) {
+		try {
+			int i = std::stoi(argv[2]);
+			if (i < OptimizeLevels.size()) {
+				optimizeFlags = OptimizeLevels[i];
+			}
+		} catch (...) {
+		}
+	}
 }
 
 
@@ -306,10 +802,31 @@ App::~App()
 		// because the device might be in the lost state already, etc.
 		device.vkDeviceWaitIdle(device.handle());
 
+		ImGui_ImplVulkan_Shutdown();
+#if defined(USE_PLATFORM_WIN32)
+		ImGui_ImplWin32_Shutdown();
+#elif defined(USE_PLATFORM_SDL3)
+		ImGui_ImplSDL3_Shutdown();
+#elif defined(USE_PLATFORM_SDL2)
+		ImGui_ImplSDL2_Shutdown();
+#elif defined(USE_PLATFORM_GLFW)
+		ImGui_ImplGlfw_Shutdown();
+#endif
+		ImGui::DestroyContext();
+
+		device.destroy(imguiPipelineCache);
+		device.destroy(imguiDescriptorPool);
+
 		// destroy handles
 		// (the handles are destructed in certain (not arbitrary) order)
 		pipelineSceneGraph.destroy();
 		stateSetRoot.destroy();
+		stateSetDrawables.destroy();
+		stateSetGUI.destroy();
+		for(auto& pss : pipelineStateSets)
+		    pss.second.destroy();
+		for(auto& pss : uberPipelineStateSets)
+			pss.second.destroy();
 		textureList.clear();
 		imageList.clear();
 		samplerList.clear();
@@ -320,6 +837,8 @@ App::~App()
 		drawableList.clear();
 		geometryList.clear();
 		sceneDataAllocation.free();
+		pipelineLibrary = nullptr;
+		shaderLibrary = nullptr;
 		device.destroy(commandPool);
 		renderer.finalize();
 		device.destroy(renderingFinishedFence);
@@ -364,10 +883,18 @@ void App::init()
 	}
 	f.exceptions(ifstream::badbit | ifstream::failbit);
 
+	stateSetRoot.childList.append(stateSetDrawables);
+	// stateSetRoot.childList.append(stateSetGUI);
+
 	// init Vulkan and window
 	VulkanWindow::init();
 	vulkanLib.load(CadR::VulkanLibrary::defaultName());
-	vulkanInstance.create(vulkanLib, "glTF reader", 0, "CADR", 0, VK_API_VERSION_1_2, nullptr,
+	vulkanInstance.create(vulkanLib, "glTF reader", 0, "CADR", 0, VK_API_VERSION_1_2,
+#ifdef VULKAN_VALIDATION
+		{"VK_LAYER_KHRONOS_validation"},
+#else
+		nullptr,
+#endif
 	                      VulkanWindow::requiredExtensions());
 	window.create(vulkanInstance.handle(), {1024,768}, "glTF reader - " + utf8FileName,
 	              vulkanLib.vkGetInstanceProcAddr);
@@ -389,16 +916,31 @@ void App::init()
 						features.get<vk::PhysicalDeviceFeatures2>().features.multiDrawIndirect &&
 						features.get<vk::PhysicalDeviceFeatures2>().features.shaderInt64 &&
 						features.get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
-						features.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress;
+						features.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress &&
+						features.get<vk::PhysicalDeviceVulkan12Features>().runtimeDescriptorArray &&
+						features.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingSampledImageUpdateAfterBind &&
+						features.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingUpdateUnusedWhilePending &&
+						features.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingPartiallyBound &&
+						features.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingVariableDescriptorCount &&
+						features.get<vk::PhysicalDeviceFeatures2>().features.geometryShader;
 				});
 	physicalDevice = std::get<0>(deviceAndQueueFamilies);
+
+	std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+	for (const auto &ext : vulkanInstance.enumerateDeviceExtensionProperties(physicalDevice)) {
+		if (std::strcmp(ext.extensionName, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0) {
+			calibratedTimestampsSupported = true;
+			extensions.emplace_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+		}
+	}
+
 	if(!physicalDevice)
 		throw ExitWithMessage(2, "No compatible Vulkan device found.");
 	device.create(
 		vulkanInstance, deviceAndQueueFamilies,
 #if 1 // enable or disable validation extensions
-      // (0 enables validation extensions and features for debugging purposes)
-		"VK_KHR_swapchain",
+	  // (0 enables validation extensions and features for debugging purposes)
+		extensions,
 		[]() {
 			CadR::Renderer::RequiredFeaturesStructChain f = CadR::Renderer::requiredFeaturesStructChain();
 			f.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy = true;  // required by samplers, or disable it in samplers when the feature is not available
@@ -408,6 +950,9 @@ void App::init()
 			f.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingUpdateUnusedWhilePending = true;  // required by CadPL
 			f.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingPartiallyBound = true;  // required by CadPL
 			f.get<vk::PhysicalDeviceVulkan12Features>().descriptorBindingVariableDescriptorCount = true;  // required by CadPL
+			f.get<vk::PhysicalDeviceFeatures2>().features.geometryShader = true;
+			f.get<vk::PhysicalDeviceVulkan12Features>().runtimeDescriptorArray = true;
+
 			return f;
 		}().get<vk::PhysicalDeviceFeatures2>()
 #else
@@ -430,7 +975,10 @@ void App::init()
 	presentationQueueFamily = std::get<2>(deviceAndQueueFamilies);
 	window.setDevice(device.handle(), physicalDevice);
 	renderer.init(device, vulkanInstance, physicalDevice, graphicsQueueFamily);
-	pipelineSceneGraph.init(stateSetRoot);
+	renderer.setCollectFrameInfo(true, calibratedTimestampsSupported);
+	pipelineSceneGraph.init(stateSetDrawables, {
+		CadPL::ShaderState::OptimizeNone, CadPL::ShaderState::OptimizeAttribs, CadPL::ShaderState::OptimizeAll,
+	}, nullptr, 2048);
 
 	// get queues
 	graphicsQueue = device.getQueue(graphicsQueueFamily, 0);
@@ -599,6 +1147,84 @@ void App::init()
 				1                                  // commandBufferCount
 			)
 		)[0];
+
+	// imgui
+	{
+		ImGui::CreateContext();
+#if defined(USE_PLATFORM_WIN32)
+		ImGui_ImplWin32_Init(window.handle());
+#elif defined(USE_PLATFORM_SDL2) || defined(USE_PLATFORM_SDL3)
+		ImGui_ImplSDL2_InitForVulkan(window.handle());
+#elif defined(USE_PLATFORM_GLFW)
+		ImGui_ImplGlfw_InitForVulkan(window.handle(), true);
+#endif
+
+		ImGui_ImplVulkan_LoadFunctions(vulkanInstance.getPhysicalDeviceProperties(physicalDevice).apiVersion, [](const char* name, void* data) {
+			return reinterpret_cast<const App*>(data)->imguiLoadFunction(name);
+		}, this);
+
+		const auto poolSizes = std::array{
+			vk::DescriptorPoolSize{  vk::DescriptorType::eCombinedImageSampler, IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE },
+		};
+		uint32_t maxSets = 0;
+		for (const auto size : poolSizes) {
+			maxSets += size.descriptorCount;
+		}
+
+		imguiPipelineCache = device.createPipelineCache(
+			vk::PipelineCacheCreateInfo(
+				vk::PipelineCacheCreateFlags(),  // flags
+				0,       // initialDataSize
+				nullptr  // pInitialData
+			)
+		);
+		imguiDescriptorPool = device.createDescriptorPool(
+			vk::DescriptorPoolCreateInfo(
+				vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,  // flags
+				maxSets,  // maxSets
+				poolSizes.size(),  // poolSizeCount
+				poolSizes.data()  // pPoolSizes
+			)
+		);
+
+		// uint32_t imageCount = device.getSwapchainImagesKHR(swapchain).size(); swapchain not created yet
+		ImGui_ImplVulkan_InitInfo init_info = {
+			.Instance        = vulkanInstance.handle(),
+			.PhysicalDevice  = physicalDevice,
+			.Device          = device.handle(),
+			.QueueFamily     = graphicsQueueFamily,
+			.Queue           = graphicsQueue,
+			.DescriptorPool  = imguiDescriptorPool,
+			.MinImageCount   = 2,
+			.ImageCount      = 2,
+			.PipelineCache   = imguiPipelineCache,
+			.PipelineInfoMain = ImGui_ImplVulkan_PipelineInfo{
+				.RenderPass = renderPass,
+				.Subpass = 0,
+				.MSAASamples = VK_SAMPLE_COUNT_1_BIT
+			},
+			.Allocator       = nullptr,
+			.CheckVkResultFn = [](VkResult result) {
+				if (result != VK_SUCCESS) {
+					throw ExitWithMessage(1, "ImGui init error.");
+				}
+			}
+		};
+
+		ImGui_ImplVulkan_Init(&init_info);
+
+		stateSetGUI.setForceRecording(true);
+		stateSetGUI.recordCallList.emplace_back([&](CadR::StateSet&, vk::CommandBuffer commandBuffer, vk::PipelineLayout) {
+			ImDrawData *data = ImGui::GetDrawData();
+			if (data) {
+				ImGui_ImplVulkan_RenderDrawData(data, commandBuffer);
+			}
+		});
+	}
+
+	// CadPL
+    shaderLibrary = std::make_unique<CadPL::ShaderLibrary>(device, 2048);
+    pipelineLibrary = std::make_unique<CadPL::PipelineLibrary>(*shaderLibrary, renderer.pipelineCache());
 
 	// parse json
 	cout << "Processing file " << utf8FilePath << "..." << endl;
@@ -1133,8 +1759,8 @@ void App::init()
 	size_t numTextures = textures.size();
 	uint32_t numTextureDescriptors = numTextures>0 ? uint32_t(numTextures) : 1;
 	layoutOnlyPipeline.init(nullptr, pipelineSceneGraph.pipelineLayout(), nullptr);
-	stateSetRoot.pipeline = &layoutOnlyPipeline;
-	stateSetRoot.allocDescriptorSets(
+	stateSetDrawables.pipeline = &layoutOnlyPipeline;
+	stateSetDrawables.allocDescriptorSets(
 		vk::DescriptorPoolCreateInfo(
 			vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,  // flags
 			1,  // maxSets
@@ -1233,7 +1859,7 @@ void App::init()
 			};
 		}
 		vk::WriteDescriptorSet writeInfo(
-			stateSetRoot.descriptorSet(0),  // dstSet
+			stateSetDrawables.descriptorSet(0),  // dstSet
 			0,  // dstBinding
 			0,  // dstArrayElement
 			uint32_t(numTextures),  // descriptorCount
@@ -1242,7 +1868,7 @@ void App::init()
 			nullptr,  // pBufferInfo
 			nullptr  // pTexelBufferView
 		);
-		stateSetRoot.updateDescriptorSet(1, &writeInfo);
+		stateSetDrawables.updateDescriptorSet(1, &writeInfo);
 	}
 
 	// create default material
@@ -1259,19 +1885,21 @@ void App::init()
 	static_assert(sizeof(PhongMaterialData) == 76 && "Wrong size of PhongMaterialData structure");
 	constexpr size_t phongMaterialDataSizeAligned8 = 80;
 	struct TextureData {
-		uint8_t texCoordIndex;
-		uint8_t type;
-		uint16_t settings;
+		// uint8_t texCoordIndex;
+		// uint8_t type;
+		// uint16_t settings;
+		uint32_t texCoordIndexTypeAndSettings;
 		uint32_t textureIndex;
-		float strength;
-		float rs1,rs2,rs3,rs4,t1,t2;  // rotation and scale in 2x2 matrix, translation in vec2
-		float blendR,blendG,blendB;  // texture blend color used in blend texture environment
+		// float strength;
+		// float rs1,rs2,rs3,rs4,t1,t2;  // rotation and scale in 2x2 matrix, translation in vec2
+		// float blendR,blendG,blendB;  // texture blend color used in blend texture environment
 	};
-	static_assert(sizeof(TextureData) == 48 && "Wrong size of TextureData structure");
+	// static_assert(sizeof(TextureData) == 48 && "Wrong size of TextureData structure");
 	struct StateSetMaterialData {
-		bool doubleSided;
-		unsigned baseColorTextureIndex;
-		unsigned baseColorTexCoordIndex;
+		std::array<TextureSetup, 6> textureSetup = {};
+		uint32_t textureOffset = 0;
+		bool doubleSided = false;
+
 	};
 	CadR::StagingData sd = defaultMaterial.alloc(sizeof(PhongMaterialData));
 	PhongMaterialData* m = sd.data<PhongMaterialData>();
@@ -1283,9 +1911,7 @@ void App::init()
 	m->pointSize = 0.f;
 	m->reflection = glm::vec3(0.f, 0.f, 0.f);
 	StateSetMaterialData defaultStateSetMaterialData {
-		.doubleSided = false,
-		.baseColorTextureIndex = ~unsigned(0),
-		.baseColorTexCoordIndex = ~unsigned(0),
+		.doubleSided = false
 	};
 
 
@@ -1297,17 +1923,37 @@ void App::init()
 	{
 		auto& material = materials.at(materialIndex);
 
+		// StateSetMaterialData
+		auto& ssm = stateSetMaterialDataList[materialIndex];
+		auto &textureSetup = ssm.textureSetup;
+
+		static constexpr auto TextureAttributeOffset = 4;
+		const auto readTexure = [&](json& parent, const std::string_view key, CadPL::TextureType type) {
+			if(auto it = parent.find(key); it != parent.end()) {
+				auto textureIndex = it->at("index").get_ref<json::number_unsigned_t&>();
+				if(textureIndex >= textureList.size())
+					throw GltfError(std::string(key) + ".index is out of range. It is not index to a valid texture.");
+				auto textureCoord = it->value("texCoord", 0);
+				if(textureCoord >= 256)
+					throw GltfError(std::string(key) + ".textureCoord is out of range");
+				auto &texture = ssm.textureSetup[static_cast<size_t>(type)];
+				uint32_t size = 8;
+				texture.settings = (size << 26) | (static_cast<uint32_t>(type) << 8) | ((textureCoord + TextureAttributeOffset) & 0xFF);
+				texture.index = textureIndex;
+				// TODO optional data
+			}
+		};
+
 		// values to be read from glTF
 		bool doubleSided;
 		glm::vec4 baseColorFactor;
-		unsigned baseColorTextureIndex;
-		unsigned baseColorTexCoordIndex;
 		float metallicFactor;
 		float roughnessFactor;
 		glm::vec3 emissiveFactor;
 
 		// material.doubleSided is optional with the default value of false
 		doubleSided = material.value<json::boolean_t>("doubleSided", false);
+		ssm.doubleSided = doubleSided;
 
 		// read pbr material properties
 		if(auto pbrIt = material.find("pbrMetallicRoughness"); pbrIt != material.end()) {
@@ -1329,27 +1975,14 @@ void App::init()
 			metallicFactor = float(pbrIt->value<json::number_float_t>("metallicFactor", 1.0));
 			roughnessFactor = float(pbrIt->value<json::number_float_t>("roughnessFactor", 1.0));
 
-			// not supported properties
-			if(auto baseColorTextureIt = pbrIt->find("baseColorTexture"); baseColorTextureIt != pbrIt->end()) {
-				baseColorTextureIndex = unsigned(baseColorTextureIt->at("index").get_ref<json::number_unsigned_t&>());
-				if(baseColorTextureIndex >= textureList.size())
-					throw GltfError("baseColorTexture.index is out of range. It is not index to a valid texture.");
-				baseColorTexCoordIndex = baseColorTextureIt->value("texCoord", 0);
-			}
-			else {
-				baseColorTextureIndex = ~unsigned(0);
-				baseColorTexCoordIndex = ~unsigned(0);
-			}
-			if(pbrIt->find("metallicRoughnessTexture") != pbrIt->end())
-				throw GltfError("Unsupported functionality: metallic-roughness texture.");
+			readTexure(pbrIt.value(), "baseColorTexture", CadPL::TextureType::base);
+			readTexure(pbrIt.value(), "metallicRoughnessTexture", CadPL::TextureType::metallicRoughness);
 
 		}
 		else
 		{
 			// default values when pbrMetallicRoughness is not present
 			baseColorFactor = glm::vec4(1.f, 1.f, 1.f, 1.f);
-			baseColorTextureIndex = ~unsigned(0);
-			baseColorTexCoordIndex = ~unsigned(0);
 			metallicFactor = 1.f;
 			roughnessFactor = 1.f;
 		}
@@ -1366,22 +1999,33 @@ void App::init()
 		else
 			emissiveFactor = glm::vec3(0.f, 0.f, 0.f);
 
+		readTexure(material, "normalTexture", CadPL::TextureType::normal);
+		readTexure(material, "occlusionTexture", CadPL::TextureType::occlusion);
+		readTexure(material, "emissiveTexture", CadPL::TextureType::emissive);
 		// not supported material properties
-		if(material.find("normalTexture") != material.end())
-			throw GltfError("Unsupported functionality: normal texture.");
-		if(material.find("occlusionTexture") != material.end())
-			throw GltfError("Unsupported functionality: occlusion texture.");
-		if(material.find("emissiveTexture") != material.end())
-			throw GltfError("Unsupported functionality: emissive texture.");
-		if(material.find("alphaMode") != material.end())
-			throw GltfError("Unsupported functionality: alpha mode.");
-		if(material.find("alphaCutoff") != material.end())
-			throw GltfError("Unsupported functionality: alpha cutoff.");
+		//
+		//				if(material->find("alphaMode") != material->end())
+		//					throw GltfError("Unsupported functionality: alpha mode.");
+		//				if(material->find("alphaCutoff") != material->end())
+		//					throw GltfError("Unsupported functionality: alpha cutoff.");
 
 		// material size
 		size_t materialSize = phongMaterialDataSizeAligned8;
-		if(baseColorTextureIndex != ~unsigned(0))
-			materialSize += 16;
+		size_t numTextures = 0;
+		for (const auto &tex : textureSetup) {
+			if (tex) {
+				// materialSize += sizeof(TextureInfoBase);
+				materialSize += 8;
+				++numTextures;
+			}
+		}
+		materialSize += sizeof(uint32_t) * 2;
+
+		materialSize += 64;
+
+		// if (numTextures) {
+			ssm.textureOffset = phongMaterialDataSizeAligned8;
+		// }
 
 		// material
 		CadR::DataAllocation& a = materialList.emplace_back(renderer.dataStorage());
@@ -1395,28 +2039,23 @@ void App::init()
 		m->pointSize = 0.f;
 		m->reflection = glm::vec3(0.f, 0.f, 0.f);
 
-		if(baseColorTextureIndex != ~unsigned(0))
-		{
-			// material base texture
-			TextureData* t = reinterpret_cast<TextureData*>(reinterpret_cast<uint8_t*>(m) + phongMaterialDataSizeAligned8);
-			t->texCoordIndex = 4 + baseColorTexCoordIndex;  // texture coordinates are placed on attribute 4 and following
-			t->type = 4;
-			t->settings = 0 | (8 << 10);  // no flags, structure size 8
-			t->textureIndex = baseColorTextureIndex;
+		m->padding1 = 0x33;
 
-			// terminating record (all zeros)
-			t = reinterpret_cast<TextureData*>(reinterpret_cast<uint8_t*>(t) + 8);
-			t->texCoordIndex = 0;
-			t->type = 0;
-			t->settings = 0;
-			t->textureIndex = 0;
+		uint8_t* texturePtr = reinterpret_cast<uint8_t*>(sd.data()) + phongMaterialDataSizeAligned8;
+		for (size_t i = 0; i < textureSetup.size(); ++i) {
+			if (textureSetup[i]) {
+				auto* textureData = reinterpret_cast<TextureData*>(texturePtr);
+				// *reinterpret_cast<uint32_t*>(texturePtr) = textureSetup[i].settings;
+
+				textureData->texCoordIndexTypeAndSettings = textureSetup[i].settings;
+				textureData->textureIndex = textureSetup[i].index;
+				texturePtr += 8;
+			}
 		}
+		// terminating record (all zeros)
+		*reinterpret_cast<uint64_t*>(texturePtr) = 0;
 
-		// StateSetMaterialData
-		auto& ssm = stateSetMaterialDataList[materialIndex];
-		ssm.doubleSided = doubleSided;
-		ssm.baseColorTextureIndex = baseColorTextureIndex;
-		ssm.baseColorTexCoordIndex = baseColorTexCoordIndex;
+
 	}
 	assert(materialList.size() == numMaterials && "Not all materials were created.");
 
@@ -1444,83 +2083,114 @@ void App::init()
 
 			// mesh.primitive helper functions
 			auto getColorFromVec4f =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					glm::vec4 r = *reinterpret_cast<glm::vec4*>(srcPtr);
-					return glm::clamp(r, 0.f, 1.f);
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					glm::vec4 r = *reinterpret_cast<const glm::vec4*>(srcPtr);
+					*reinterpret_cast<glm::vec4*>(dstPtr) = glm::clamp(r, 0.f, 1.f);
 				};
 			auto getColorFromVec3f =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							glm::clamp(*reinterpret_cast<glm::vec3*>(srcPtr), 0.f, 1.f),
+							glm::clamp(*reinterpret_cast<const glm::vec3*>(srcPtr), 0.f, 1.f),
 							1.f
 						);
 				};
 			auto getColorFromVec4us =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint16_t*>(srcPtr)[0]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[1]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[2]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[3]) / 65535.f
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[0]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[1]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[2]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[3]) / 65535.f
 						);
 				};
 			auto getColorFromVec3us =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint16_t*>(srcPtr)[0]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[1]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[2]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[0]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[1]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[2]) / 65535.f,
 							1.f
 						);
 				};
 			auto getColorFromVec4ub =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint8_t*>(srcPtr)[0]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[1]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[2]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[3]) / 255.f
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[0]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[1]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[2]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[3]) / 255.f
 						);
 				};
 			auto getColorFromVec3ub =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint8_t*>(srcPtr)[0]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[1]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[2]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[0]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[1]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[2]) / 255.f,
 							1.f
 						);
 				};
-			auto getTexCoordFromVec2f =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+			auto getPosFromVec3 =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) = glm::vec4(
+							*reinterpret_cast<const glm::vec3*>(srcPtr),
+							1.f
+						);
+			};
+			auto getVec3 =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec3*>(dstPtr) = *reinterpret_cast<const glm::vec3*>(srcPtr);
+			};
+			auto getVec2FromVec2f =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec2*>(dstPtr) = *reinterpret_cast<const glm::vec2*>(srcPtr);
+			};
+			auto getVec2FromVec2us =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec2*>(dstPtr) =
+						glm::vec2(
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[0]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[1]) / 65535.f
+						);
+			};
+			auto getVec2FromVec2ub =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec2*>(dstPtr) =
+						glm::vec2(
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[0]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[1]) / 255.f
+						);
+			};
+			auto getVec4FromVec2f =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							*reinterpret_cast<glm::vec2*>(srcPtr),
+							*reinterpret_cast<const glm::vec2*>(srcPtr),
 							0.f,
 							0.f
 						);
 				};
-			auto getTexCoordFromVec2us =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+			auto getVec4FromVec2us =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint16_t*>(srcPtr)[0]) / 65535.f,
-							float(reinterpret_cast<uint16_t*>(srcPtr)[1]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[0]) / 65535.f,
+							float(reinterpret_cast<const uint16_t*>(srcPtr)[1]) / 65535.f,
 							0.f,
 							0.f
 						);
 				};
-			auto getTexCoordFromVec2ub =
-				[](uint8_t* srcPtr) -> glm::vec4 {
-					return
+			auto getVec4FromVec2ub =
+				[](const uint8_t* srcPtr, uint8_t* dstPtr) {
+					*reinterpret_cast<glm::vec4*>(dstPtr) =
 						glm::vec4(
-							float(reinterpret_cast<uint8_t*>(srcPtr)[0]) / 255.f,
-							float(reinterpret_cast<uint8_t*>(srcPtr)[1]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[0]) / 255.f,
+							float(reinterpret_cast<const uint8_t*>(srcPtr)[1]) / 255.f,
 							0.f,
 							0.f
 						);
@@ -1592,22 +2262,34 @@ void App::init()
 			auto& attributes = primitive.at("attributes");
 			uint32_t vertexSize = 0;
 			size_t numVertices = 0;
-			glm::vec3* positionData = nullptr;
-			glm::vec3* normalData = nullptr;
-			unsigned positionDataStride;
-			unsigned normalDataStride;
-			uint8_t* colorData = nullptr;
-			glm::vec4 (*getColorFunc)(uint8_t* srcPtr);
-			uint8_t* texCoordData = nullptr;
-			glm::vec4 (*getTexCoordFunc)(uint8_t* srcPtr);
-			unsigned colorDataStride;
-			unsigned texCoordDataStride;
+
+			struct Attribute {
+				uint8_t *sourceData = nullptr;
+				unsigned sourceDataStride = 0;
+				unsigned dataSize = 0;
+				CadPL::AttributeType type = {};
+				void (*getterFunc)(const uint8_t* srcPtr, uint8_t* dstPtr) = nullptr;
+
+				operator bool() const noexcept {
+					return sourceData;
+				}
+			};
+
+			Attribute positionAttribute;
+			Attribute normalAttribute;
+			Attribute tangentAttribute;
+			Attribute colorAttribute;
+			std::vector<Attribute> attributeSources;
+
 			CadR::BoundingBox primitiveSetBB;
+
+            if (attributes.size() > 16) {
+                throw GltfError("Too many attributes.");
+            }
+            std::array<uint16_t, 16> attribInfo = {};
+
 			for(auto it = attributes.begin(); it != attributes.end(); it++) {
 				if(it.key() == "POSITION") {
-
-					// vertex size
-					vertexSize += 16;
 
 					// accessor
 					json& accessor = accessors.at(it.value().get_ref<json::number_unsigned_t&>());
@@ -1628,8 +2310,14 @@ void App::init()
 					// update numVertices
 					updateNumVertices(accessor, numVertices);
 
+					positionAttribute.type = CadPL::AttributeType::vec3align16;
+					positionAttribute.dataSize = 16;
+					positionAttribute.getterFunc = getPosFromVec3;
+					// vertex size
+					vertexSize += positionAttribute.dataSize;
+
 					// position data and stride
-					tie(reinterpret_cast<void*&>(positionData), positionDataStride) =
+					tie(reinterpret_cast<void*&>(positionAttribute.sourceData), positionAttribute.sourceDataStride) =
 						getDataPointerAndStride(accessor, bufferViews, buffers, bufferDataList,
 						                        numVertices, sizeof(glm::vec3));
 
@@ -1658,9 +2346,6 @@ void App::init()
 				}
 				else if(it.key() == "NORMAL") {
 
-					// vertex size
-					vertexSize += 16;
-
 					// accessor
 					json& accessor = accessors.at(it.value().get_ref<json::number_unsigned_t&>());
 
@@ -1680,16 +2365,22 @@ void App::init()
 					// update numVertices
 					updateNumVertices(accessor, numVertices);
 
+					normalAttribute.type = CadPL::AttributeType::vec3align16;
+					normalAttribute.dataSize = 16;
+					normalAttribute.getterFunc = getVec3;
+					// vertex size
+					vertexSize += normalAttribute.dataSize;
+
 					// normal data and stride
-					tie(reinterpret_cast<void*&>(normalData), normalDataStride) =
+					tie(reinterpret_cast<void*&>(normalAttribute.sourceData), normalAttribute.sourceDataStride) =
 						getDataPointerAndStride(accessor, bufferViews, buffers, bufferDataList,
 						                        numVertices, sizeof(glm::vec3));
 
 				}
+                else if(it.key() == "TANGENT") {
+                    // TODO
+                }
 				else if(it.key() == "COLOR_0") {
-
-					// vertex size
-					vertexSize += 16;
 
 					// accessor
 					json& accessor = accessors.at(it.value().get_ref<json::number_unsigned_t&>());
@@ -1721,31 +2412,55 @@ void App::init()
 					// update numVertices
 					updateNumVertices(accessor, numVertices);
 
+					colorAttribute.type = CadPL::AttributeType::vec3align16;
+					colorAttribute.dataSize = 16;
+					// vertex size
+					vertexSize += colorAttribute.dataSize;
+
 					// getColorFunc and elementSize
 					size_t elementSize;
-					if(t == "VEC4")
-						switch(ct) {
-						case 5126: getColorFunc = getColorFromVec4f;  elementSize = 16; break;
-						case 5121: getColorFunc = getColorFromVec4ub; elementSize = 4;  break;
-						case 5123: getColorFunc = getColorFromVec4us; elementSize = 8;  break;
-						}
-					else // "VEC3"
-						switch(ct) {
-						case 5126: getColorFunc = getColorFromVec3f;  elementSize = 12; break;
-						case 5121: getColorFunc = getColorFromVec3ub; elementSize = 3;  break;
-						case 5123: getColorFunc = getColorFromVec3us; elementSize = 6;  break;
-						}
+					if(t == "VEC4") {
+                        switch (ct) {
+                            case 5126:
+                                colorAttribute.getterFunc = getColorFromVec4f;
+                                elementSize = 16;
+                                break;
+                            case 5121:
+                                colorAttribute.getterFunc = getColorFromVec4ub;
+                                elementSize = 4;
+                                break;
+                            case 5123:
+                                colorAttribute.getterFunc = getColorFromVec4us;
+                                elementSize = 8;
+                                break;
+                        }
+                        colorAttribute.type = CadPL::AttributeType::vec4align16;
+                    }
+					else { // "VEC3"
+                        switch (ct) {
+                            case 5126:
+                                colorAttribute.getterFunc = getColorFromVec3f;
+                                elementSize = 12;
+                                break;
+                            case 5121:
+                                colorAttribute.getterFunc = getColorFromVec3ub;
+                                elementSize = 3;
+                                break;
+                            case 5123:
+                                colorAttribute.getterFunc = getColorFromVec3us;
+                                elementSize = 6;
+                                break;
+                        }
+                        colorAttribute.type = CadPL::AttributeType::vec3align16;
+                    }
 
 					// color data and stride
-					tie(reinterpret_cast<void*&>(colorData), colorDataStride) =
+					tie(reinterpret_cast<void*&>(colorAttribute.sourceData), colorAttribute.sourceDataStride) =
 						getDataPointerAndStride(accessor, bufferViews, buffers, bufferDataList,
 						                        numVertices, elementSize);
 
 				}
-				else if(it.key() == "TEXCOORD_0") {
-
-					// vertex size
-					vertexSize += 16;
+				else if(it.key().starts_with("TEXCOORD_")) {
 
 					// accessor
 					json& accessor = accessors.at(it.value().get_ref<json::number_unsigned_t&>());
@@ -1777,22 +2492,50 @@ void App::init()
 					// update numVertices
 					updateNumVertices(accessor, numVertices);
 
-					// getTexCoordFunc and elementSize
+					auto &source = attributeSources.emplace_back();
+
+					source.type = CadPL::AttributeType::vec2align8;
+					source.dataSize = 8;
+					// vertex size
+					vertexSize += source.dataSize;
+
+					// get func and elementSize
 					size_t elementSize;
 					switch(ct) {
-					case 5126: getTexCoordFunc = getTexCoordFromVec2f;  elementSize = 8; break;
-					case 5121: getTexCoordFunc = getTexCoordFromVec2ub; elementSize = 2; break;
-					case 5123: getTexCoordFunc = getTexCoordFromVec2us; elementSize = 4; break;
+					case 5126: source.getterFunc = getVec2FromVec2f;  elementSize = 8; break;
+					case 5121: source.getterFunc = getVec2FromVec2ub; elementSize = 2; break;
+					case 5123: source.getterFunc = getVec2FromVec2us; elementSize = 4; break;
 					}
 
 					// texCoord data and stride
-					tie(reinterpret_cast<void*&>(texCoordData), texCoordDataStride) =
+					tie(reinterpret_cast<void*&>(source.sourceData), source.sourceDataStride) =
 						getDataPointerAndStride(accessor, bufferViews, buffers, bufferDataList,
 						                        numVertices, elementSize);
-
 				}
 				else
 					throw GltfError("Unsupported functionality: " + it.key() + " attribute.");
+			}
+
+			// align vertexSize to multiples of 16 to avoid issues
+			const auto vertexPadding = vertexSize & 15;
+			vertexSize = (vertexSize + 15) & ~15;
+
+			// fill attribute information
+			{
+				uint16_t offset = 0;
+				const auto fillAttribute = [&](size_t index, const Attribute &attribute) {
+					if (attribute) {
+						attribInfo[index] = offset | (static_cast<uint32_t>(attribute.type) << 8);
+						offset += attribute.dataSize;
+					}
+				};
+				fillAttribute(0, positionAttribute);
+				fillAttribute(1, normalAttribute);
+				fillAttribute(3, colorAttribute);
+				size_t i = 3;
+				for (auto &attribute : attributeSources) {
+					fillAttribute(++i, attribute);
+				}
 			}
 
 			// indices
@@ -1850,7 +2593,7 @@ void App::init()
 				continue;
 
 			// create Geometry
-			cout << "Creating geometry" << endl;
+			std::cout << "Creating geometry of " << mesh.value("name", "{}") << "\n";
 			CadR::Geometry& g = geometryList.emplace_back(renderer);
 
 			// update mesh bounds
@@ -1858,45 +2601,37 @@ void App::init()
 
 			// prepare for computing primitiveSet bounding sphere
 			CadR::BoundingSphere primitiveSetBS{
-				.center = positionData ? primitiveSetBB.getCenter() : glm::vec3(0.f, 0.f, 0.f),
+				.center = positionAttribute ? primitiveSetBB.getCenter() : glm::vec3(0.f, 0.f, 0.f),
 				.radius = 0.f,  // actually, radius^2 is stored here in the following loop as an performance optimization
 			};
 
 			// set vertex data
 			CadR::StagingData sd = g.createVertexStagingData(numVertices * vertexSize);
 			uint8_t* p = sd.data<uint8_t>();
+			const auto copyAttribute = [&](Attribute &attrib) {
+				attrib.getterFunc(attrib.sourceData, p);
+				attrib.sourceData += attrib.sourceDataStride;
+				p += attrib.dataSize;
+			};
+
 			for(size_t i=0; i<numVertices; i++) {
-				if(positionData) {
-
-					// copy position
-					glm::vec3 pos(*positionData);
-					*reinterpret_cast<glm::vec4*>(p)= glm::vec4(pos.x, pos.y, pos.z, 1.f);
-					p += 16;
-					positionData = reinterpret_cast<glm::vec3*>(reinterpret_cast<uint8_t*>(positionData) + positionDataStride);
-
+				if(positionAttribute) {
+					glm::vec3 pos = *reinterpret_cast<glm::vec3*>(positionAttribute.sourceData);
+					copyAttribute(positionAttribute);
 					// update bounding sphere
 					// (square of radius is stored in primitiveBS.radius)
 					primitiveSetBS.extendRadiusByPointUsingRadius2(pos);
-
 				}
-				if(normalData) {
-					glm::vec3 normal = glm::vec3(*normalData);
-					*reinterpret_cast<glm::vec4*>(p) = glm::vec4(normal.x, normal.y, normal.z, 0.f);
-					p += 16;
-					normalData = reinterpret_cast<glm::vec3*>(reinterpret_cast<uint8_t*>(normalData) + normalDataStride);
+				if(normalAttribute) {
+					copyAttribute(normalAttribute);
 				}
-				if(colorData) {
-					glm::vec4* v = reinterpret_cast<glm::vec4*>(p);
-					*v = getColorFunc(colorData);
-					p += 16;
-					colorData += colorDataStride;
+				if(colorAttribute) {
+					copyAttribute(colorAttribute);
 				}
-				if(texCoordData) {
-					glm::vec4* v = reinterpret_cast<glm::vec4*>(p);
-					*v = getTexCoordFunc(texCoordData);
-					p += 16;
-					texCoordData += texCoordDataStride;
+				for (auto &src : attributeSources) {
+					copyAttribute(src);
 				}
+				p += vertexPadding;
 			}
 
 			// mesh.primitive.mode is optional with default value 4 (TRIANGLES)
@@ -2253,113 +2988,96 @@ void App::init()
 				? stateSetMaterialDataList.at(materialIndex)
 				: defaultStateSetMaterialData;
 
-			// pipeline
-			CadPL::ShaderState shaderState{
-				.idBuffer = false,
-				.primitiveTopology =
-					[](unsigned mode) -> vk::PrimitiveTopology
-					{
-						switch(mode) {
-						case 0:  // POINTS
-							return vk::PrimitiveTopology::ePointList;
-						case 1:  // LINES
-						case 2:  // LINE_LOOP
-						case 3:  // LINE_STRIP
-							return vk::PrimitiveTopology::eLineList;
-						case 4:  // TRIANGLES
-						case 5:  // TRIANGLE_STRIP
-						case 6:  // TRIANGLE_FAN
-							return vk::PrimitiveTopology::eTriangleList;
-						default:
-							throw GltfError("Invalid value for mesh.primitive.mode.");
-						}
-					}(mode),
-				.projectionHandling =
-					CadPL::ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants,
-				.attribAccessInfo =
-					[=]() {
-						decltype(CadPL::ShaderState::attribAccessInfo) r;
-						uint16_t offset = 0x10;
+			vk::PrimitiveTopology primitiveTopology;
+			switch(mode) {
+				case 0:  // POINTS
+					primitiveTopology = vk::PrimitiveTopology::ePointList;
+					break;
+				case 1:  // LINES
+				case 2:  // LINE_LOOP
+				case 3:  // LINE_STRIP
+					primitiveTopology = vk::PrimitiveTopology::eLineList;
+					break;
+				case 4:  // TRIANGLES
+				case 5:  // TRIANGLE_STRIP
+				case 6:  // TRIANGLE_FAN
+					primitiveTopology = vk::PrimitiveTopology::eTriangleList;
+					break;
+				default:
+					throw GltfError("Invalid value for mesh.primitive.mode.");
+			}
 
-						// vertices: float3, alignment 16, offset 0
-						r[0] = 0x2000;
+			uint32_t materialSettings = ssMaterialData.textureOffset;
+			materialSettings |= 0x0001;
+			if (ssMaterialData.doubleSided) materialSettings |= 0x100;  // two sided lighting
+			if (colorAttribute) materialSettings |=  0x0200;  // use color attribute for ambient and diffuse
 
-						// normals: float3, alignment 16
-						if(normalData) {
-							r[1] = 0x2010;
-							offset += 0x10;
-						} else
-							r[1] = 0;
+			uint32_t attribSetup = (normalAttribute ? 0 : 1) |  // generateFlatNormals
+									vertexSize;
 
-						// tangents
-						r[2] = 0;
+			CadR::StateSet* ss;
+			if (true) {
+				// get StateSet
+				PipelineStateSet& pipelineStateSet = getPipelineStateSet(
+					optimizeFlags,
+					primitiveTopology,
+					ssMaterialData.doubleSided ? vk::CullModeFlagBits::eNone : vk::CullModeFlagBits::eBack,
+					vk::FrontFace::eCounterClockwise,
+					materialSettings,
+					attribSetup,
+					attribInfo,
+					ssMaterialData.textureSetup
+				);
+				ss = &pipelineStateSet.stateSet;
+			}
+			else {
+				// pipeline
+				CadPL::ShaderState shaderState{
+					.idBuffer = false,
+					.primitiveTopology = primitiveTopology,
+					.projectionHandling =
+						CadPL::ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants,
+					.attribAccessInfo = attribInfo,
+					.attribSetup = attribSetup,
+					.materialSetup = materialSettings,
+					.lightSetup = {},  // no lights; switches between directional light, point light and spotlight
+					.numLights = {},
+					.textureSetup = {},  // no textures
+					.numTextures = {},
+					.optimizeFlags = CadPL::ShaderState::OptimizeNone,
+				};
+				CadPL::PipelineState pipelineState{
+					.viewportAndScissorHandling = CadPL::PipelineState::ViewportAndScissorHandling::SetFunction,
+					.projectionIndex = 0,
+					.viewportIndex = 0,
+					.scissorIndex = 0,
+					.viewport = {},
+					.scissor = {},
+					.cullMode =
+						(ssMaterialData.doubleSided)
+							? vk::CullModeFlagBits::eNone   // eNone - nothing is discarded
+							: vk::CullModeFlagBits::eBack,  // eBack - back-facing triangles are discarded, eFront - front-facing triangles are discarded
+					.frontFace = vk::FrontFace::eCounterClockwise,
+					.depthBiasDynamicState = false,
+					.depthBiasEnable = false,
+					.depthBiasConstantFactor = 0.f,
+					.depthBiasClamp = 0.f,
+					.depthBiasSlopeFactor = 0.f,
+					.lineWidthDynamicState = false,
+					.lineWidth = 1.f,
+					.rasterizationSamples = vk::SampleCountFlagBits::e1,
+					.sampleShadingEnable = false,
+					.minSampleShading = 0.f,
+					.depthTestEnable = true,
+					.depthWriteEnable = true,
+					.blendState = { { .blendEnable = false } },
+					.renderPass = renderPass,
+					.subpass = 0,
+				};
+				ss = &pipelineSceneGraph.getOrCreateStateSet(shaderState, pipelineState);
+			}
 
-						// colors: float4, alignment 16
-						if(colorData) {
-							r[3] = 0x0100 | offset;
-							offset += 0x10;
-						} else
-							r[3] = 0;
-
-						// texCoords: float2, alignment 8
-						if(texCoordData) {
-							r[4] = 0x5000 | offset;
-							offset += 0x10;
-						} else
-							r[4] = 0;
-
-						// fill the rest with zeros
-						for(size_t i=5; i<r.size(); i++)
-							r[i] = 0;
-
-						return r;
-					}(),
-				.attribSetup =
-					(normalData ? 0 : 1) |  // generateFlatNormals
-					(16u + (normalData ? 16 : 0) + (colorData ? 16 : 0) + (texCoordData ? 16 : 0)),  // vertexDataSize
-				.materialSetup =
-					0x0001 |  // Phong
-					((ssMaterialData.baseColorTextureIndex == ~unsigned(0))  // texture offset
-						? 0 : uint32_t(phongMaterialDataSizeAligned8)) |
-					(ssMaterialData.doubleSided ? 0x100 : 0) |  // two sided lighting
-					(colorData ? 0x0200 : 0) |  // use color attribute for ambient and diffuse
-					0,  // do not ignore alpha anywhere (on color attribute, on material and on base texture)
-				.lightSetup = {},  // no lights; switches between directional light, point light and spotlight
-				.numLights = {},
-				.textureSetup = {},  // no textures
-				.numTextures = {},
-				.optimizeFlags = CadPL::ShaderState::OptimizeNone,
-			};
-			CadPL::PipelineState pipelineState{
-				.viewportAndScissorHandling = CadPL::PipelineState::ViewportAndScissorHandling::SetFunction,
-				.projectionIndex = 0,
-				.viewportIndex = 0,
-				.scissorIndex = 0,
-				.viewport = {},
-				.scissor = {},
-				.cullMode =
-					(ssMaterialData.doubleSided)
-						? vk::CullModeFlagBits::eNone   // eNone - nothing is discarded
-						: vk::CullModeFlagBits::eBack,  // eBack - back-facing triangles are discarded, eFront - front-facing triangles are discarded
-				.frontFace = vk::FrontFace::eCounterClockwise,
-				.depthBiasDynamicState = false,
-				.depthBiasEnable = false,
-				.depthBiasConstantFactor = 0.f,
-				.depthBiasClamp = 0.f,
-				.depthBiasSlopeFactor = 0.f,
-				.lineWidthDynamicState = false,
-				.lineWidth = 1.f,
-				.rasterizationSamples = vk::SampleCountFlagBits::e1,
-				.sampleShadingEnable = false,
-				.minSampleShading = 0.f,
-				.depthTestEnable = true,
-				.depthWriteEnable = true,
-				.blendState = { { .blendEnable = false } },
-				.renderPass = renderPass,
-				.subpass = 0,
-			};
-			CadR::StateSet& ss = pipelineSceneGraph.getOrCreateStateSet(shaderState, pipelineState);
-
+			std::cout << "stateSet: " << ss << "\n";
 			// drawable
 			drawableList.emplace_back(
 				g,  // geometry
@@ -2368,7 +3086,7 @@ void App::init()
 				(materialIndex==~size_t(0))  // drawableData
 					? defaultMaterial
 					: materialList[materialIndex],
-				ss  // stateSet
+				*ss  // stateSet
 			);
 
 			// mesh bounding sphere
@@ -2387,7 +3105,7 @@ void App::init()
 					glm::mat3(matrices[0]) * glm::vec3(meshBS.radius)  // halfExtents
 				);
 			for(size_t instanceIndex=1, instanceCount=matrices.size();
-			    instanceIndex<instanceCount; instanceIndex++)
+				instanceIndex<instanceCount; instanceIndex++)
 			{
 				const glm::mat4& m = matrices[instanceIndex];
 				instancesBB.extendBy(
@@ -2404,7 +3122,7 @@ void App::init()
 				.radius = 0.f,
 			};
 			for(size_t instanceIndex=0, instanceCount=matrices.size();
-			    instanceIndex<instanceCount; instanceIndex++)
+				instanceIndex<instanceCount; instanceIndex++)
 			{
 				instancesBS.extendRadiusBy(matrices[instanceIndex] * meshBS);
 			}
@@ -2430,6 +3148,8 @@ void App::init()
 	// initial camera distance
 	float fovy2Clamped = glm::clamp(fovy / 2.f, 1.f / 180.f * glm::pi<float>(), 90.f / 180.f * glm::pi<float>());
 	cameraDistance = sceneBoundingSphere.radius / sin(fovy2Clamped);
+
+	setCamera(sceneBoundingSphere.center - glm::vec3(sceneBoundingSphere.radius, sceneBoundingSphere.radius, 0), sceneBoundingSphere.center, glm::vec3(0.f, 1.f, 0.f));
 
 #if 0  // show scene bounding sphere
 	auto createBoundingSphereVisualization =
@@ -2558,7 +3278,7 @@ void App::resize(VulkanWindow& window,
 				array<uint32_t, 2>{graphicsQueueFamily, presentationQueueFamily}.data(),  // pQueueFamilyIndices
 				surfaceCapabilities.currentTransform,    // preTransform
 				vk::CompositeAlphaFlagBitsKHR::eOpaque,  // compositeAlpha
-				vk::PresentModeKHR::eFifo,  // presentMode
+				vk::PresentModeKHR::eImmediate,  // presentMode
 				VK_TRUE,  // clipped
 				swapchain  // oldSwapchain
 			)
@@ -2703,10 +3423,21 @@ void App::resize(VulkanWindow& window,
 	pipelineSceneGraph.setProjectionViewportAndScissor(
 		projectionMatrix,
 		vk::Viewport(0.f, 0.f,
-		             float(newSurfaceExtent.width), float(newSurfaceExtent.height),
-		             0.f, 1.f),
+					 float(newSurfaceExtent.width), float(newSurfaceExtent.height),
+					 0.f, 1.f),
 		vk::Rect2D(vk::Offset2D(0, 0), newSurfaceExtent)
 	);
+
+	pipelineLibrary->setProjectionViewportAndScissor(
+		projectionMatrix,
+		vk::Viewport(0.f, 0.f,
+					 float(newSurfaceExtent.width), float(newSurfaceExtent.height),
+					 0.f, 1.f),
+		vk::Rect2D(vk::Offset2D(0, 0), newSurfaceExtent)
+	);
+
+	// recreate pipelines
+	setPipelines();
 }
 
 
@@ -2729,12 +3460,25 @@ void App::frame(VulkanWindow&)
 	}
 	device.resetFences(renderingFinishedFence);
 
+    // collect previous frame info
+    auto info = renderer.getFrameInfo();
+    double cpuTime = double(info.cpuEndFrame - info.cpuBeginFrame) * renderer.cpuTimestampPeriod();
+    double gpuTime = double(info.gpuEndExecution - info.gpuBeginExecution) * renderer.gpuTimestampPeriod();
+    cpuTimeCounter.update(cpuTime);
+    gpuTimeCounter.update(gpuTime);
+
 	// _sceneDataAllocation
-	uint32_t sceneDataSize = 192 + 2*lightGpuDataSize;  // 192 is for basic scene data plus light data while one additional light is used as terminating element
+	uint32_t sceneDataSize = uint32_t(sizeof(SceneGpuData));
 	CadR::StagingData sceneStagingData = sceneDataAllocation.alloc(sceneDataSize);
 	SceneGpuData* sceneData = sceneStagingData.data<SceneGpuData>();
-	sceneData->viewMatrix =
-		glm::lookAtLH(
+
+	float distance;
+	if (newCamera) {
+		sceneData->viewMatrix = glm::lookAtLH(cameraEye, cameraEye + cameraDirection, cameraUp);
+		distance = glm::distance(sceneBoundingSphere.center, cameraEye);
+	}
+	else {
+		sceneData->viewMatrix = glm::lookAtLH(
 			sceneBoundingSphere.center + glm::vec3(  // eye
 				+cameraDistance*sin(-cameraHeading)*cos(cameraElevation),  // x
 				-cameraDistance*sin(cameraElevation),  // y
@@ -2743,8 +3487,11 @@ void App::frame(VulkanWindow&)
 			sceneBoundingSphere.center,  // center
 			glm::vec3(0.f,1.f,0.f)  // up
 		);
-	float zFar = fabs(cameraDistance) + sceneBoundingSphere.radius;
-	float zNear = fabs(cameraDistance) - sceneBoundingSphere.radius;
+		distance = cameraDistance;
+	}
+
+	float zFar = fabs(distance) + sceneBoundingSphere.radius;
+	float zNear = fabs(distance) - sceneBoundingSphere.radius;
 	float minZNear = zFar / maxZNearZFarRatio;
 	if(zNear < minZNear)
 		zNear = minZNear;
@@ -2755,7 +3502,7 @@ void App::frame(VulkanWindow&)
 	sceneData->p33 = projectionMatrix[2][2];
 	sceneData->p43 = projectionMatrix[3][2];
 	sceneData->ambientLight = glm::vec3(0.2f, 0.2f, 0.2f);
-	sceneData->numLights = 1;
+	sceneData->numLights = 0;
 	sceneData->padding = {};
 	sceneData->lights[0].eyePositionOrDirection = glm::vec3(0.f, 0.f, 0.f);
 	sceneData->lights[0].settings = 2;  // bits 0..1: 1 - directional light, 2 - point light, 3 - spotlight
@@ -2776,6 +3523,8 @@ void App::frame(VulkanWindow&)
 	sceneData->lights[1] = {
 		.settings = 0,
 	};
+
+	renderGUI();
 
 	// begin the frame
 	renderer.beginFrame();
@@ -2883,14 +3632,41 @@ void App::frame(VulkanWindow&)
 	// (gpu computations might be running asynchronously now
 	// and presentation might be waiting for the rendering to finish)
 	renderer.endFrame();
+
+	if (noPause) {
+		window.scheduleFrame();
+	}
 }
 
 
 void App::mouseMove(VulkanWindow& window, const VulkanWindow::MouseState& mouseState)
 {
+	if (ImGui::GetIO().WantCaptureMouse) {
+		return;
+	}
 	if(mouseState.buttons[VulkanWindow::MouseButton::Left]) {
-		cameraHeading = startCameraHeading + (mouseState.posX - startMouseX) * 0.01f;
-		cameraElevation = startCameraElevation + (mouseState.posY - startMouseY) * 0.01f;
+
+		if (newCamera) {
+			cameraAngles += glm::vec2{
+				(prevMouseX - mouseState.posX) * cameraSensitivity,
+				glm::clamp((mouseState.posY - prevMouseY) * cameraSensitivity, -glm::half_pi<float>(), glm::half_pi<float>())
+			};
+			prevMouseX = mouseState.posX;
+			prevMouseY = mouseState.posY;
+
+			const float cosy = cos(cameraAngles.y);
+			cameraDirection = glm::normalize(glm::vec3{
+				cos(cameraAngles.x) * cosy,
+				sin(cameraAngles.y),
+				sin(cameraAngles.x) * cosy
+			});
+			cameraRight = glm::normalize(glm::cross(cameraDirection, cameraUp));
+		}
+		else {
+			cameraHeading = startCameraHeading + (mouseState.posX - startMouseX) * 0.01f;
+			cameraElevation = startCameraElevation + (mouseState.posY - startMouseY) * 0.01f;
+		}
+
 		window.scheduleFrame();
 	}
 }
@@ -2899,10 +3675,16 @@ void App::mouseMove(VulkanWindow& window, const VulkanWindow::MouseState& mouseS
 void App::mouseButton(VulkanWindow& window, size_t button, VulkanWindow::ButtonState buttonState,
                       const VulkanWindow::MouseState& mouseState)
 {
+	if (ImGui::GetIO().WantCaptureMouse) {
+		return;
+	}
 	if(button == VulkanWindow::MouseButton::Left) {
 		if(buttonState == VulkanWindow::ButtonState::Pressed) {
 			startMouseX = mouseState.posX;
 			startMouseY = mouseState.posY;
+			prevMouseX = mouseState.posX;
+			prevMouseY = mouseState.posY;
+
 			startCameraHeading = cameraHeading;
 			startCameraElevation = cameraElevation;
 		}
@@ -2917,10 +3699,123 @@ void App::mouseButton(VulkanWindow& window, size_t button, VulkanWindow::ButtonS
 
 void App::mouseWheel(VulkanWindow& window, float wheelX, float wheelY, const VulkanWindow::MouseState& mouseState)
 {
-	cameraDistance *= pow(zoomStepRatio, wheelY);
+	if (ImGui::GetIO().WantCaptureMouse) {
+		return;
+	}
+	if (newCamera) {
+		fovy -= wheelY * 0.1;
+	}
+	else {
+		cameraDistance *= pow(zoomStepRatio, wheelY);
+	}
 	window.scheduleFrame();
 }
 
+void App::key(VulkanWindow& window, VulkanWindow::KeyState keyState, VulkanWindow::ScanCode scanCode)
+{
+	if (ImGui::GetIO().WantCaptureKeyboard) {
+		return;
+	}
+    if (keyState == VulkanWindow::KeyState::Pressed) {
+    	switch (scanCode) {
+    		case VulkanWindow::ScanCode::W:
+    			cameraEye += cameraDirection * cameraSpeed;
+    			window.scheduleFrame();
+    			break;
+    		case VulkanWindow::ScanCode::S:
+    			cameraEye -= cameraDirection * cameraSpeed;
+    			window.scheduleFrame();
+    			break;
+    		case VulkanWindow::ScanCode::A:
+    			cameraEye += cameraRight * cameraSpeed;
+    			window.scheduleFrame();
+    			break;
+    		case VulkanWindow::ScanCode::D:
+    			cameraEye -= cameraRight * cameraSpeed;
+    			window.scheduleFrame();
+    			break;
+    		case VulkanWindow::ScanCode::One:
+    			useUberShader = true;
+    			setPipelines();
+    			window.scheduleFrame();
+    			std::cout << "Switched to uber shader\n";
+    			break;
+    		case VulkanWindow::ScanCode::Two:
+    			useUberShader = false;
+    			setPipelines();
+    			window.scheduleFrame();
+    			std::cout << "Switched to optimized shader\n";
+    			break;
+    		case VulkanWindow::ScanCode::C:
+    			newCamera = !newCamera;
+    			window.scheduleFrame();
+    			break;
+    		case VulkanWindow::ScanCode::R:
+    			break;
+    		default:
+    			break;
+    	}
+    }
+}
+
+void App::setCamera(glm::vec3 position, glm::vec3 target, glm::vec3 up)
+{
+	cameraEye = position;
+	cameraDirection = glm::normalize(target - cameraEye);
+	cameraUp = up;
+	cameraRight = glm::normalize(glm::cross(cameraDirection, up));
+	cameraAngles = {
+		std::atan2(cameraDirection.z, cameraDirection.x),
+		std::asin(cameraDirection.y)
+	};
+}
+
+void App::renderGUI() {
+	ImGui_ImplVulkan_NewFrame();
+#if defined(USE_PLATFORM_WIN32)
+	ImGui_ImplWin32_NewFrame();
+#elif defined(USE_PLATFORM_SDL3)
+	ImGui_ImplSDL3NewFrame();
+#elif defined(USE_PLATFORM_SDL2)
+	ImGui_ImplSDL2_NewFrame();
+#elif defined(USE_PLATFORM_GLFW)
+	ImGui_ImplGlfw_NewFrame();
+#endif
+
+	ImGui::NewFrame();
+
+	if (ImGui::Begin("Debug", &imguiPanel, 0)) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= lastDebugTime) {
+			lastDebugTime = now + std::chrono::seconds(1);
+			double time = gpuTimeCounter.get();
+			std::stringstream str;
+			if (time > 1.0) {
+				str << time << "s";
+			}
+			else if (time > 1e-3) {
+				str << time * 1e3 << "ms";
+			}
+			else if (time > 1e-6) {
+				str << time * 1e6 << "us";
+			}
+			else if (time > 1e-9) {
+				str << time * 1e9 << "ns";
+			}
+			// if (time > 0) {
+			// 	std::cout << ", fps: " << 1.0 / time << "\n";
+			// }
+			guiFrameTime = std::move(str.str());
+		}
+		ImGui::Text("Frame time: %s", guiFrameTime.c_str());
+
+		ImGui::End();
+	}
+
+	ImGui::EndFrame();
+
+	ImGui::Render();
+}
 
 uint32_t getStride(int componentType,const string& type)
 {
@@ -3025,6 +3920,8 @@ try {
 		cout << "Failed to set console code page to utf-8." << endl;
 #endif
 
+    CadPL::ShaderGenerator::initializeCache();
+
 	// init application
 	App app(argc, argv);
 	app.init();
@@ -3049,6 +3946,9 @@ try {
 	app.window.setMouseWheelCallback(
 		bind(&App::mouseWheel, &app, placeholders::_1, placeholders::_2, placeholders::_3, placeholders::_4)
 	);
+    app.window.setKeyCallback(
+        bind(&App::key, &app, placeholders::_1, placeholders::_2, placeholders::_3)
+    );
 
 	// show window and run main loop
 	app.window.show();
