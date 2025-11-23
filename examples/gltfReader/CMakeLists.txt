@@ -54,7 +54,6 @@ else()
 	message(FATAL_ERROR "Unsupported imgui backend: ${GUI_TYPE}")
 endif()
 
-
 # executable
 add_executable(${APP_NAME} ${APP_SOURCES} ${APP_INCLUDES})
 

@@ -21,6 +21,8 @@ set(CADPL_PUBLIC_HEADERS
 	PipelineLibrary.h
 	ShaderGenerator.h
 	ShaderLibrary.h
+	ShaderState.h
+	DebugUtils.h
 	)
 
 # private headers
@@ -33,7 +35,19 @@ set(CADPL_SOURCES
 	PipelineLibrary.cpp
 	ShaderGenerator.cpp
 	ShaderLibrary.cpp
+	ShaderState.cpp
+	DebugUtils.cpp
 	)
+
+set(CADPL_PREGEN_SOURCES
+	Pregenerate.cpp
+	ShaderGenerator.h
+	ShaderGenerator.cpp
+	DebugUtils.h
+	DebugUtils.cpp
+	ShaderState.h
+	ShaderState.cpp
+)
 
 # grouping of source files
 source_group("Code" FILES ${CADPL_PUBLIC_HEADERS} ${CADPL_PRIVATE_HEADERS} ${CADPL_SOURCES})
@@ -49,20 +63,24 @@ option(SHADERC_SKIP_EXAMPLES "Skip building examples" ON)
 option(SHADERC_SKIP_EXECUTABLES  "Skip building executables." ON)
 add_subdirectory(../../3rdParty/shaderc shaderc_build)
 
-# shaders
-add_shader(UberShader.vert  ""  shaders/UberShader.vert.spv  CADPL_SHADER_DEPS)
-add_shader(UberShader.geom  ""  shaders/UberShader.geom.spv  CADPL_SHADER_DEPS)
-add_shader(UberShader.frag  ""  shaders/UberShader.frag.spv  CADPL_SHADER_DEPS)
-add_shader(UberShader.vert  -DID_BUFFER  shaders/UberShader-idBuffer.vert.spv  CADPL_SHADER_DEPS)
-add_shader(UberShader.geom  -DID_BUFFER  shaders/UberShader-idBuffer.geom.spv  CADPL_SHADER_DEPS)
-add_shader(UberShader.frag  -DID_BUFFER  shaders/UberShader-idBuffer.frag.spv  CADPL_SHADER_DEPS)
-
 add_custom_command(
-		OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp
-		COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/ShaderGenerator.cpp -DDST=${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp -P ${CMAKE_CURRENT_SOURCE_DIR}/generator_hash.cmake
-		DEPENDS ShaderGenerator.cpp
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp
+	COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/ShaderGenerator.cpp -DDST=${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp -P ${CMAKE_CURRENT_SOURCE_DIR}/generator_hash.cmake
+	DEPENDS ShaderGenerator.cpp
 )
 add_custom_target(generator_hash DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ShaderGeneratorHash.hpp)
+
+add_executable(${LIB_NAME}_pregen ${CADPL_PREGEN_SOURCES})
+set_property(TARGET ${LIB_NAME}_pregen PROPERTY CXX_STANDARD 20)
+target_link_libraries(${LIB_NAME}_pregen Vulkan::Headers CadR shaderc_shared)
+target_include_directories(${LIB_NAME}_pregen PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+add_custom_command(
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/PregeneratedShaders.hpp
+	COMMAND ${LIB_NAME}_pregen ${CMAKE_CURRENT_BINARY_DIR}/shaders
+	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	DEPENDS ${CADPL_PREGEN_SOURCES}
+)
 
 # CADR library
 add_library(${LIB_NAME}
@@ -70,9 +88,9 @@ add_library(${LIB_NAME}
 	${CADPL_PUBLIC_HEADERS}
 	${CADPL_PRIVATE_HEADERS}
 	${CADPL_SOURCES}
-	${CADPL_SHADER_DEPS}
+	${CMAKE_CURRENT_BINARY_DIR}/shaders/PregeneratedShaders.hpp
 	)
-add_dependencies(${LIB_NAME} generator_hash)
+add_dependencies(${LIB_NAME} generator_hash ${LIB_NAME}_pregen)
 
 # compile definitions
 if(WIN32)
@@ -83,15 +101,29 @@ if(WIN32)
 			INTERFACE
 				"CADPL_EXPORT=__declspec(dllimport)"
 		)
+		target_compile_definitions(${LIB_NAME}_pregen
+				PRIVATE
+				"CADPL_EXPORT=__declspec(dllexport)"
+				INTERFACE
+				"CADPL_EXPORT=__declspec(dllimport)"
+		)
 	else()
 		target_compile_definitions(${LIB_NAME}
 			PUBlIC
+				"CADPL_EXPORT="
+		)
+		target_compile_definitions(${LIB_NAME}_pregen
+				PUBlIC
 				"CADPL_EXPORT="
 		)
 	endif()
 else()
 	target_compile_definitions(${LIB_NAME}
 		PUBLIC
+			"CADPL_EXPORT=__attribute__((visibility(\"default\")))"
+	)
+	target_compile_definitions(${LIB_NAME}_pregen
+			PUBLIC
 			"CADPL_EXPORT=__attribute__((visibility(\"default\")))"
 	)
 endif()
@@ -108,7 +140,9 @@ target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(${LIB_NAME} Vulkan::Headers glm CadR shaderc_shared)
 
 # other target settings
-set_property(TARGET ${LIB_NAME} PROPERTY CXX_STANDARD 17)
+set_property(TARGET ${LIB_NAME} PROPERTY CXX_STANDARD 20)
+
+target_compile_definitions(${LIB_NAME} PUBLIC CADPL_USE_PREGEN)
 
 # headers installation
 install(FILES

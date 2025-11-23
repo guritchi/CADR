@@ -195,7 +195,7 @@ void StateSet::recordToCommandBuffer(vk::CommandBuffer commandBuffer, vk::Pipeli
 {
 	// optimization
 	// to not process StateSet subgraphs that does not have any Drawables
-	if(_skipRecording)
+	if(_skipRecording || disabled)
 		return;
 
 	// bind pipeline
@@ -243,6 +243,17 @@ void StateSet::recordToCommandBuffer(vk::CommandBuffer commandBuffer, vk::Pipeli
 				_renderer->drawablePointersBufferAddress() + (drawableCounter * Renderer::drawablePointersRecordSize),  // stateSetDrawablePointersPtr
 			}.data()
 		);
+
+		if (!pushConstantData.empty()) {
+			device.cmdPushConstants(
+			        commandBuffer,  // commandBuffer
+			        currentPipelineLayout,  // pipelineLayout
+			        vk::ShaderStageFlagBits::eAllGraphics,
+			        16,  // offset
+			        pushConstantData.size(),  // size
+					pushConstantData.data() // pValues
+			);
+		}
 
 		// draw command
 		device.cmdDrawIndirect(

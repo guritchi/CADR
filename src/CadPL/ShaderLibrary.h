@@ -1,55 +1,18 @@
 #pragma once
 
-#include <array>
-#include <bitset>
+#include <future>
 #include <map>
-#include <sstream>
-#include <iomanip>
 #include <vulkan/vulkan.hpp>
+
+#include "ShaderState.h"
+
+#include "CadR/VulkanDevice.h"
 
 namespace CadR {
 class VulkanDevice;
 }
 
 namespace CadPL {
-
-
-struct CADPL_EXPORT ShaderState {
-
-	bool idBuffer;
-	vk::PrimitiveTopology primitiveTopology;
-	enum class ProjectionHandling { SceneMatrix, PerspectivePushAndSpecializationConstants };
-	ProjectionHandling projectionHandling = ProjectionHandling::SceneMatrix;
-
-	static constexpr const unsigned maxNumAttribs = 16;
-	std::array<uint16_t,maxNumAttribs> attribAccessInfo;
-	uint32_t attribSetup;
-	uint32_t materialSetup;
-	uint16_t lightSetup[4];
-	uint16_t numLights;
-	uint32_t textureSetup[6];
-	uint16_t numTextures;
-
-	static constexpr const unsigned numOptimizeFlags = 7;
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeNone = 0x00;  //< No optimizations. Uber-shader will be used.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeAttribs = 0x01;  //< Optimize attribute access. Number of attributes, their indices, their type and data offset are fixed and hardcoded into the shader code. 
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeMaterialModel = 0x02;  //< Optimize material model (unlit, phong, metallic-roughness,...). The material model is fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeMaterialColorAttribute = 0x04;  //< Optimize phong color attribute settings (color to diffuse, color to ambient and diffuse). The settings are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeMaterialAlpha = 0x08;  //< Optimize alpha computation (ignore texture alpha, ignore material alpha, ignore color attribute alpha). The alpha flags are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeMaterial = 0x0e;  //< Optimize all material related settings. The settings are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeTextureTypesAndTexCoordIndices = 0x10;  //< Optimize texture types and attribute indices from which texture coordinates are sourced. Number of textures, their types (normal texture, occlusion texture, emissive texture, base texture,...) and attribute indices for sourcing texture coordinates are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeTextureFlags = 0x20;  //< Optimize texture flags (apply strength, apply texture coordinate transformation, blend color included, phong's texture environment, first component index). The settings are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeTextures = 0x30;  //< Optimize all texture related settings. The settings are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeLightTypes = 0x40;  //< Optimize light types. Number of lights and their types are fixed and hardcoded into the shader code.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeLights = 0x40;  //< Optimize all light related settings.
-	static constexpr const std::bitset<numOptimizeFlags> OptimizeAll = 0x7f;  //< Make all available optimizations.
-
-	std::bitset<numOptimizeFlags> optimizeFlags = OptimizeNone;
-
-	bool operator<(const ShaderState& rhs) const;
-
-};
-
 
 class CADPL_EXPORT SharedShaderModule {
 protected:
@@ -69,6 +32,12 @@ public:
 	explicit operator bool() const;
 	void reset() noexcept;
 
+	bool isValid() const;
+	bool aquireCompileFlag();
+	void waitIfCompiling();
+
+	vk::ShaderModuleIdentifierEXT* getIdentifier() const;
+
 protected:
 	friend class ShaderLibrary;
 	SharedShaderModule(void* shaderModuleObject) noexcept;
@@ -79,42 +48,39 @@ class CADPL_EXPORT ShaderLibrary {
 protected:
 
 	CadR::VulkanDevice* _device = nullptr;
+	PFN_vkGetShaderModuleIdentifierEXT vkGetShaderModuleIdentifierEXT = {};
+	bool identifierDatabaseDirty = false;
 
-	enum class OwningMap { eUnknown = 0, eVertex, eGeometry, eFragment };
 	struct AbstractShaderModuleObject {
 		size_t referenceCounter;  //< Reference counter. It must be on the beginning of this structure because of implementation of some functions in this class.
 		vk::ShaderModule shaderModule;  //< Shader module handle. It must be on the second place in this structure because of implementation of some functions in this class.
 		ShaderLibrary* shaderLibrary;  //< ShaderLibrary owning this ShaderModuleObject. It must be on the third place in this structure because of implementation of some functions in this class.
-		OwningMap owningMap;  //< It indicates the map that this structure is member of. It must be on the fourth place in this structure because of implementation of some functions in this class.
+		vk::ShaderStageFlags owningMap;  //< It indicates the map that this structure is member of. It must be on the fourth place in this structure because of implementation of some functions in this class.
+		vk::ShaderModuleIdentifierEXT identifier; //< Vulkan identifier
+		std::atomic_flag compiling;
 	};
 	template<typename MapKey>
 	struct ShaderModuleObject : AbstractShaderModuleObject {
 		typename std::map<MapKey,ShaderModuleObject<MapKey>>::iterator eraseIt;  //< Iterator for removing this object from the map when the referenceCounter reaches zero.
 	};
 
-	struct VertexShaderMapKey {
-		bool idBuffer;
-		ShaderState::ProjectionHandling projectionHandling;
-		VertexShaderMapKey(const ShaderState& shaderState);
-		bool operator<(const VertexShaderMapKey& rhs) const;
-	};
-	struct GeometryShaderMapKey {
-		bool idBuffer;
-		GeometryShaderMapKey(const ShaderState& shaderState);
-		bool operator<(const GeometryShaderMapKey& rhs) const  { return idBuffer < rhs.idBuffer; }
-	};
-	struct FragmentShaderMapKey {
-		bool idBuffer;
-		FragmentShaderMapKey(const ShaderState& shaderState);
-		bool operator<(const FragmentShaderMapKey& rhs) const  { return idBuffer < rhs.idBuffer; }
-	};
+	template <typename MapKey>
+	static void serializeMap(std::string_view prefix, const std::map<MapKey, ShaderModuleObject<MapKey>> &map, std::stringstream &output);
+
+	using VertexShaderMapKey = VertexShaderState;
+	using GeometryShaderMapKey = GeometryShaderState;
+	using FragmentShaderMapKey = FragmentShaderState;
 
 	std::map<VertexShaderMapKey, ShaderModuleObject<VertexShaderMapKey>> _vertexShaderMap;
 	std::map<GeometryShaderMapKey, ShaderModuleObject<GeometryShaderMapKey>> _geometryShaderMap;
 	std::map<FragmentShaderMapKey, ShaderModuleObject<FragmentShaderMapKey>> _fragmentShaderMap;
+
 	vk::PipelineLayout _pipelineLayout;
 	vk::DescriptorSetLayout _descriptorSetLayout;
 	std::vector<vk::DescriptorSetLayout> _descriptorSetLayoutList;
+
+	std::mutex mutex;
+	bool _useShaderModuleIdentifier = false;
 
 	static void refShaderModule(void* shaderModuleObject) noexcept;
 	static void unrefShaderModule(void* shaderModuleObject) noexcept;
@@ -130,13 +96,31 @@ public:
 	void init(CadR::VulkanDevice& device, uint32_t maxTextures = 250000);
 	void destroy() noexcept;
 
-	// synchronous API to get and create pipelines
+	// synchronous API to get and create shaders
 	SharedShaderModule getOrCreateVertexShader(const ShaderState& state);
 	SharedShaderModule getOrCreateGeometryShader(const ShaderState& state);
 	SharedShaderModule getOrCreateFragmentShader(const ShaderState& state);
+	SharedShaderModule getOrEmplaceVertexShader(const ShaderState& state);
+	SharedShaderModule getOrEmplaceGeometryShader(const ShaderState& state);
+	SharedShaderModule getOrEmplaceFragmentShader(const ShaderState& state);
 	SharedShaderModule getVertexShader(const ShaderState& state);
 	SharedShaderModule getGeometryShader(const ShaderState& state);
 	SharedShaderModule getFragmentShader(const ShaderState& state);
+
+	// asynchronous API to get and create shaders
+	std::future<void> createVertexShaderAsync(const ShaderState& state, SharedShaderModule& shader);
+	std::future<void> createGeometryShaderAsync(const ShaderState& state, SharedShaderModule& shader);
+	std::future<void> createFragmentShaderAsync(const ShaderState& state, SharedShaderModule& shader);
+
+	struct ShaderSet {
+		SharedShaderModule vertex;
+		SharedShaderModule geometry;
+		SharedShaderModule fragment;
+	};
+
+	void createShaders(const ShaderState& state, SharedShaderModule &vertex, SharedShaderModule &geometry, SharedShaderModule &fragment);
+	ShaderSet getOrCreateShaders(const ShaderState& state, bool compile = false);
+	ShaderSet getShadersWithoutCompilation(const ShaderState& state);
 
 	// getters
 	CadR::VulkanDevice& device() const;
@@ -144,6 +128,35 @@ public:
 	vk::DescriptorSetLayout descriptorSetLayout() const;
 	const std::vector<vk::DescriptorSetLayout>& descriptorSetLayoutList() const;
 
+	size_t count() const noexcept;
+	size_t identifierCount() const noexcept;
+	size_t countVertex() const noexcept;
+	size_t countGeometry() const noexcept;
+	size_t countFragment() const noexcept;
+
+	// VK_EXT_shader_module_identifier
+	void setShaderModuleIdentifierEnabled(bool enabled, const CadR::VulkanDevice &device);
+	bool useShaderModuleIdentifier() const noexcept;
+	vk::ShaderModuleIdentifierEXT getShaderModuleIdentifier(vk::ShaderModule shaderModule);
+	void saveIdentifierDatabase();
+	void loadIdentifierDatabase();
+
+private:
+	void setIdentifierVertex(const std::string& serializedState, const vk::ShaderModuleIdentifierEXT &identifier);
+	void setIdentifierFragment(const std::string& serializedState, const vk::ShaderModuleIdentifierEXT &identifier);
+	void setIdentifierGeometry(const std::string& serializedState, const vk::ShaderModuleIdentifierEXT &identifier);
+
+	template <typename MapKey>
+	bool containsShaderModuleObjects(const std::map<MapKey, ShaderModuleObject<MapKey>> &map) const;
+
+	template <typename MapKey>
+	SharedShaderModule getOrCreateShader(const ShaderState& state, std::map<MapKey, ShaderModuleObject<MapKey>> &map, vk::ShaderModule (*create)(const ShaderState& state, CadR::VulkanDevice& device, const std::string &cacheName));
+
+	template <typename MapKey>
+	ShaderModuleObject<MapKey>* getOrEmplace(const MapKey& state, std::map<MapKey, ShaderModuleObject<MapKey>> &map);
+
+	template <typename MapKey>
+	void createAsync(const ShaderState &state, vk::ShaderModule (*create)(const ShaderState& state, CadR::VulkanDevice& device, const std::string&), SharedShaderModule* shaderModule);
 };
 
 
@@ -158,11 +171,8 @@ inline vk::ShaderModule SharedShaderModule::get() const  { return static_cast<Sh
 inline SharedShaderModule::operator vk::ShaderModule() const  { return static_cast<ShaderLibrary::AbstractShaderModuleObject*>(_smObject)->shaderModule; }
 inline SharedShaderModule::operator bool() const  { return _smObject; }
 inline void SharedShaderModule::reset() noexcept  { if(!_smObject) return; ShaderLibrary::unrefShaderModule(_smObject); _smObject=nullptr; }
+inline vk::ShaderModuleIdentifierEXT* SharedShaderModule::getIdentifier() const { return _smObject? &static_cast<ShaderLibrary::AbstractShaderModuleObject*>(_smObject)->identifier : nullptr;}
 
-inline ShaderLibrary::VertexShaderMapKey::VertexShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer), projectionHandling(shaderState.projectionHandling) {}
-inline ShaderLibrary::GeometryShaderMapKey::GeometryShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer) {}
-inline ShaderLibrary::FragmentShaderMapKey::FragmentShaderMapKey(const ShaderState& shaderState)  : idBuffer(shaderState.idBuffer) {}
-inline bool ShaderLibrary::VertexShaderMapKey::operator<(const ShaderLibrary::VertexShaderMapKey& rhs) const  { if(idBuffer < rhs.idBuffer) return true; if(idBuffer > rhs.idBuffer) return false; return projectionHandling < rhs.projectionHandling; }
 inline void ShaderLibrary::refShaderModule(void* shaderModuleObject) noexcept  { auto* smObject=static_cast<ShaderLibrary::AbstractShaderModuleObject*>(shaderModuleObject); smObject->referenceCounter++; }
 inline void ShaderLibrary::unrefShaderModule(void* shaderModuleObject) noexcept  { auto* smObject=static_cast<ShaderLibrary::AbstractShaderModuleObject*>(shaderModuleObject); if(smObject->referenceCounter==1) ShaderLibrary::destroyShaderModule(smObject); else smObject->referenceCounter--; }
 inline SharedShaderModule ShaderLibrary::getVertexShader(const ShaderState& state)  { auto it=_vertexShaderMap.find(state); return (it!=_vertexShaderMap.end()) ? SharedShaderModule(&it->second) : SharedShaderModule(); }
@@ -173,4 +183,12 @@ inline vk::PipelineLayout ShaderLibrary::pipelineLayout() const  { return _pipel
 inline vk::DescriptorSetLayout ShaderLibrary::descriptorSetLayout() const  { return _descriptorSetLayout; }
 inline const std::vector<vk::DescriptorSetLayout>& ShaderLibrary::descriptorSetLayoutList() const  { return _descriptorSetLayoutList; }
 
+inline size_t ShaderLibrary::count() const noexcept { return countVertex() + countGeometry() + countFragment(); }
+inline size_t ShaderLibrary::identifierCount() const noexcept { size_t count = 0; for (const auto &o : _vertexShaderMap) if (o.second.identifier.identifierSize > 0) ++count; for (const auto &o : _geometryShaderMap) if (o.second.identifier.identifierSize > 0) ++count; for (const auto &o : _fragmentShaderMap) if (o.second.identifier.identifierSize > 0) ++count; return count; }
+inline size_t ShaderLibrary::countVertex() const noexcept { size_t count = 0; for (const auto &o : _vertexShaderMap) if (o.second.referenceCounter > 0) count++; return count; }
+inline size_t ShaderLibrary::countGeometry() const noexcept { size_t count = 0; for (const auto &o : _geometryShaderMap) if (o.second.referenceCounter > 0) count++; return count; }
+inline size_t ShaderLibrary::countFragment() const noexcept { size_t count = 0; for (const auto &o : _fragmentShaderMap) if (o.second.referenceCounter > 0) count++; return count; }
+
+inline void ShaderLibrary::setShaderModuleIdentifierEnabled(bool enabled, const CadR::VulkanDevice &device) { _useShaderModuleIdentifier = enabled; if (enabled) { vkGetShaderModuleIdentifierEXT = (PFN_vkGetShaderModuleIdentifierEXT)device.getProcAddr("vkGetShaderModuleIdentifierEXT"); if (!vkGetShaderModuleIdentifierEXT) throw std::runtime_error("Unsupported Vulkan functionality"); } }
+inline bool ShaderLibrary::useShaderModuleIdentifier() const noexcept { return _useShaderModuleIdentifier; }
 }

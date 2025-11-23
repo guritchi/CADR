@@ -1,5 +1,11 @@
 #include <CadPL/PipelineLibrary.h>
 #include <CadR/VulkanDevice.h>
+#include <CadPL/ShaderGenerator.h>
+
+#include <CadPL/DebugUtils.h>
+
+#include <iostream>
+#include <chrono>
 
 using namespace std;
 using namespace CadPL;
@@ -29,6 +35,18 @@ static constexpr const std::array specializationMap {
 
 PipelineLibrary::~PipelineLibrary()
 {
+	stopBackgroundThread();
+	{ // clear hanging pipelines
+		std::unique_lock lk(_compilationOutputMutex);
+		for (auto &batch : _compilationOutputQueue) {
+			for (auto &data : batch) {
+				if (data.pipeline) {
+					_device->destroy(data.pipeline);
+				}
+			}
+		}
+		_compilationOutputQueue.clear();
+	}
 	assert(_pipelineFamilyMap.empty() && "PipelineLibrary::~PipelineLibrary(): All pipelines "
 		"owned by PipelineLibrary must be released before destroying PipelineLibrary.");
 }
@@ -39,6 +57,19 @@ PipelineFamily::~PipelineFamily()
 	assert(_pipelineMap.empty() && "PipelineFamily::~PipelineFamily(): All SharedPipelines must be released before destroying PipelineFamily or PipelineLibrary.");
 }
 
+void PipelineFamily::initialize(const ShaderState& shaderState, std::map<ShaderState, PipelineFamily>::iterator it, bool createShaders)
+{
+	assert(_pipelineLibrary && "PipelineFamily is missing prior initialization");
+
+	it->second._mapIterator = it;
+	it->second._primitiveTopology = shaderState.primitiveTopology;
+
+	auto* shaderLibrary = _pipelineLibrary->_shaderLibrary;
+	auto set = createShaders? shaderLibrary->getOrCreateShaders(shaderState) : shaderLibrary->getShadersWithoutCompilation(shaderState);
+	it->second._vertexShader   = set.vertex;
+	it->second._geometryShader = set.geometry;
+	it->second._fragmentShader = set.fragment;
+}
 
 void PipelineFamily::destroyPipeline(void* pipelineObject) noexcept
 {
@@ -51,13 +82,8 @@ void PipelineFamily::destroyPipeline(void* pipelineObject) noexcept
 		pf->_pipelineLibrary->_pipelineFamilyMap.erase(pf->_mapIterator);
 }
 
-
-SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipelineState)
+void PipelineFamily::initializeRecord(std::map<PipelineState, PipelineObject>::iterator &it)
 {
-	auto [it, newRecord] = _pipelineMap.try_emplace(pipelineState);
-	if(!newRecord)
-		return SharedPipeline(&it->second);
-
 	// initialize new record
 	// (do not throw until SharedPipeline is created)
 	it->second.cadrPipeline.init(
@@ -68,6 +94,16 @@ SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipeline
 	it->second.referenceCounter = 0;
 	it->second.pipelineFamily = this;
 	it->second.mapIterator = it;
+	it->second._compilePending = false;
+}
+
+SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipelineState, bool &canCreate)
+{
+	canCreate = false;
+	auto [it, newRecord] = _pipelineMap.try_emplace(pipelineState);
+	if(!newRecord)
+		return SharedPipeline(&it->second);;
+	initializeRecord(it);
 	SharedPipeline sharedPipeline(&it->second);
 
 	// if viewport, scissor or projection matrix were not set yet
@@ -75,37 +111,87 @@ SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipeline
 	// (the pipeline will be created in setProjectionViewportAndScissor() or similar function)
 	if(pipelineState.viewportAndScissorHandling == PipelineState::ViewportAndScissorHandling::SetFunction &&
 		(_pipelineLibrary->_viewportList.empty() || _pipelineLibrary->_scissorList.empty()))
-			return sharedPipeline;
+		return sharedPipeline;
 	if(_mapIterator->first.projectionHandling == ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants &&
 		_pipelineLibrary->_specializationData.empty())
-			return sharedPipeline;
+		return sharedPipeline;
 
-	// create pipeline
-	PipelineLibrary::CreationDataSet creationDataSet(*_pipelineLibrary);
-	creationDataSet.append(SharedPipeline(&it->second), pipelineState);
-	creationDataSet.createPipelines(*_pipelineLibrary);
+	canCreate = true;
 	return sharedPipeline;
 }
 
-
-SharedPipeline PipelineLibrary::getOrCreatePipeline(const ShaderState& shaderState, const PipelineState& pipelineState)
+SharedPipeline PipelineFamily::getOrCreatePipeline(const PipelineState& pipelineState)
 {
+	const auto start = std::chrono::system_clock::now();
+	bool canCreate;
+	SharedPipeline sharedPipeline = getOrCreatePipeline(pipelineState, canCreate);
+	if (canCreate) {
+		PipelineLibrary::CreationDataSet creationDataSet(*_pipelineLibrary);
+		creationDataSet.append(SharedPipeline(sharedPipeline), pipelineState);
+		creationDataSet.createPipelines(*_pipelineLibrary);
+		const auto end = std::chrono::system_clock::now();
+		CadPL::Debug::log("", "mainCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+		CadPL::Debug::increment("mainCreateCount", 1);
+	}
+	return sharedPipeline;
+}
+
+SharedPipeline PipelineLibrary::getOrCreatePipeline(const ShaderState& shaderState, const PipelineState& pipelineState) {
+	std::unique_lock lk(_pipelineFamilyMapMutex);
+	const auto start = std::chrono::system_clock::now();
 	auto [it, newRecord] = _pipelineFamilyMap.try_emplace(shaderState, *this);
 	if(newRecord) {
 		try {
-			it->second._vertexShader = _shaderLibrary->getOrCreateVertexShader(shaderState);
-			it->second._geometryShader = _shaderLibrary->getOrCreateGeometryShader(shaderState);
-			it->second._fragmentShader = _shaderLibrary->getOrCreateFragmentShader(shaderState);
+			it->second.initialize(shaderState, it);
+			const auto end = std::chrono::system_clock::now();
+			CadPL::Debug::log("", "mainCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
 		} catch(...) {
 			_pipelineFamilyMap.erase(it);
 			throw;
 		}
-		it->second._mapIterator = it;
-		it->second._primitiveTopology = shaderState.primitiveTopology;
 	}
 	return it->second.getOrCreatePipeline(pipelineState);
 }
 
+std::vector<SharedPipeline> PipelineLibrary::getOrCreatePipelines(const std::vector<std::pair<ShaderState, PipelineState>> &states)
+{
+	const auto start = std::chrono::system_clock::now();
+	std::vector<SharedPipeline> pipelines;
+	CreationDataSet creationDataSet(*this);
+	{
+		std::unique_lock lk(_pipelineFamilyMapMutex);
+		for (const auto &state : states) {
+
+			const PipelineState& pipelineState = state.second;
+			if(pipelineState.viewportAndScissorHandling == PipelineState::ViewportAndScissorHandling::SetFunction)
+			{
+				// update viewport and scissor
+				const_cast<vk::Viewport&>(pipelineState.viewport) =
+					_viewportList.at(pipelineState.viewportIndex);
+				const_cast<vk::Rect2D&>(pipelineState.scissor) =
+					_scissorList.at(pipelineState.scissorIndex);
+			}
+			else if(state.first.projectionHandling != ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants)
+				continue;
+
+			auto [it, newRecord] = _pipelineFamilyMap.try_emplace(state.first, *this);
+			if(newRecord) {
+				it->second.initialize(state.first, it);
+			}
+			bool canCreate;
+			SharedPipeline sharedPipeline = it->second.getOrCreatePipeline(state.second, canCreate);
+			if (canCreate) {
+				creationDataSet.append(SharedPipeline(sharedPipeline), pipelineState);
+			}
+		}
+	}
+	const auto count = creationDataSet.count();
+	creationDataSet.createPipelines(*this);
+	const auto end = std::chrono::system_clock::now();
+	CadPL::Debug::log("", "mainCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+	CadPL::Debug::increment("mainCreateCount", count);
+	return pipelines;
+}
 
 void PipelineLibrary::setProjectionViewportAndScissor(const std::vector<glm::mat4x4>& projectionMatrixList,
 	const std::vector<vk::Viewport>& viewportList, const std::vector<vk::Rect2D>& scissorList)
@@ -126,6 +212,11 @@ void PipelineLibrary::setProjectionViewportAndScissor(const std::vector<glm::mat
 	_viewportList = viewportList;
 	_scissorList = scissorList;
 
+	// recompileAllPipelines();
+}
+
+void PipelineLibrary::recompileAllPipelines()
+{
 	// CreationDataSet - used for storing all pipeline creation data
 	// so we create pipelines in batches and not one by one.
 	// This might allow Vulkan driver for speeding up creation.
@@ -133,6 +224,7 @@ void PipelineLibrary::setProjectionViewportAndScissor(const std::vector<glm::mat
 
 	// create list of pipelines to be recompiled
 	for(auto familyIt=_pipelineFamilyMap.begin(); familyIt!=_pipelineFamilyMap.end(); familyIt++) {
+
 		const ShaderState& shaderState = familyIt->first;
 		PipelineFamily& f = familyIt->second;
 		for(auto pipelineIt=f._pipelineMap.begin(); pipelineIt!=f._pipelineMap.end(); pipelineIt++) {
@@ -141,9 +233,9 @@ void PipelineLibrary::setProjectionViewportAndScissor(const std::vector<glm::mat
 			{
 				// update viewport and scissor
 				const_cast<vk::Viewport&>(pipelineState.viewport) =
-					viewportList.at(pipelineState.viewportIndex);
+					_viewportList.at(pipelineState.viewportIndex);
 				const_cast<vk::Rect2D&>(pipelineState.scissor) =
-					scissorList.at(pipelineState.scissorIndex);
+					_scissorList.at(pipelineState.scissorIndex);
 
 				// append pipeline into the set for recompilation
 				creationDataSet.append(SharedPipeline(&pipelineIt->second), pipelineState);
@@ -155,12 +247,56 @@ void PipelineLibrary::setProjectionViewportAndScissor(const std::vector<glm::mat
 	}
 
 	// create pipelines
+	const auto count = creationDataSet.count();
+	const auto start = std::chrono::system_clock::now();
 	creationDataSet.createPipelines(*this);
+	const auto end = std::chrono::system_clock::now();
+	CadPL::Debug::log("", "mainCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+	CadPL::Debug::increment("mainCreateCount", count);
 }
 
+void PipelineLibrary::recompilePipelines(const std::vector<std::pair<ShaderState, PipelineState>> &states)
+{
+	CreationDataSet creationDataSet(*this);
+	std::cout << "recompilePipelines(): " << states.size() << std::endl;
+	for (const auto& state : states) {
+		auto familyIt = _pipelineFamilyMap.find(state.first);
+		if (familyIt != _pipelineFamilyMap.end()) {
+			auto pipelineIt = familyIt->second._pipelineMap.find(state.second);
+			if (pipelineIt != familyIt->second._pipelineMap.end()) {
+				const PipelineState& pipelineState = pipelineIt->first;
+				if(pipelineState.viewportAndScissorHandling == PipelineState::ViewportAndScissorHandling::SetFunction)
+				{
+					// update viewport and scissor
+					const_cast<vk::Viewport&>(pipelineState.viewport) =
+						_viewportList.at(pipelineState.viewportIndex);
+					const_cast<vk::Rect2D&>(pipelineState.scissor) =
+						_scissorList.at(pipelineState.scissorIndex);
+
+					std::cout << "new viewport: " << pipelineState.viewport.x << "," << pipelineState.viewport.y << ", " << pipelineState.viewport.width << "," << pipelineState.viewport.height << std::endl;
+
+					// append pipeline into the set for recompilation
+					creationDataSet.append(SharedPipeline(&pipelineIt->second), pipelineState);
+				}
+				else if(state.first.projectionHandling == ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants)
+					// append pipeline into the set for recompilation
+					creationDataSet.append(SharedPipeline(&pipelineIt->second), pipelineState);
+			}
+		}
+	}
+
+	// create pipelines
+	const auto count = creationDataSet.count();
+	const auto start = std::chrono::system_clock::now();
+	creationDataSet.createPipelines(*this);
+	const auto end = std::chrono::system_clock::now();
+	CadPL::Debug::log("", "mainCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+	CadPL::Debug::increment("mainCreateCount", count);
+}
 
 PipelineLibrary::CreationDataSet::CreationDataSet(const PipelineLibrary& pipelineLibrary)
-	: specializationList(pipelineLibrary._specializationData.size())
+	: pipelineLibrary(&pipelineLibrary)
+    , specializationList(pipelineLibrary._specializationData.size())
 	, viewportList(pipelineLibrary._viewportList)
 	, scissorList(pipelineLibrary._scissorList)
 {
@@ -179,15 +315,22 @@ PipelineLibrary::CreationDataSet::CreationDataSet(const PipelineLibrary& pipelin
 }
 
 
-void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline, const PipelineState& pipelineState)
-{
+void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline, const PipelineState& pipelineState) {
 	assert(numSharedPipelines < sharedPipelineList.size() && "CreationDataBatch::append(): CreationDataBatch is full. Cannot append more pipelines.");
 	assert(sharedPipeline.cadrPipeline() != nullptr && "SharedPipeline object must not be empty.");
 
 	// get info from sharedPipeline before we move it
-	const PipelineFamily& pipelineFamily = *sharedPipeline.pipelineFamily();
+	PipelineFamily& pipelineFamily = const_cast<PipelineFamily&>(*sharedPipeline.pipelineFamily());
 	vk::PipelineLayout pipelineLayout = pipelineFamily._pipelineLibrary->pipelineLayout();
 	const ShaderState& shaderState = pipelineFamily.shaderState();
+
+	if(pipelineState.viewportAndScissorHandling == PipelineState::ViewportAndScissorHandling::SetFunction) {
+		// update viewport and scissor
+		const_cast<vk::Viewport&>(pipelineState.viewport) =
+			creationDataSet->viewportList.at(pipelineState.viewportIndex);
+		const_cast<vk::Rect2D&>(pipelineState.scissor) =
+			creationDataSet->scissorList.at(pipelineState.scissorIndex);
+	}
 
 	// move sharedPipeline
 	sharedPipelineList[numSharedPipelines] = sharedPipeline;
@@ -196,6 +339,11 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	// flags
 	auto& createInfo = createInfoList[numCreateInfos];
 	createInfo.flags = vk::PipelineCreateFlags();
+	auto *flags = &createFlagsList[numCreateInfos].flags;
+	if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
+		*flags = vk::PipelineCreateFlagBits2KHR::eCaptureData;
+		createInfo.pNext = &createFlagsList[numCreateInfos];
+	}
 	numCreateInfos++;
 
 	// specializationInfo
@@ -207,35 +355,48 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	// stageCount and pStages
 	vk::PipelineShaderStageCreateInfo* shaderStages = &shaderStageList[numShaderStages];
 	numShaderStages += 3;
-	shaderStages[0] =
-		vk::PipelineShaderStageCreateInfo{
-			vk::PipelineShaderStageCreateFlags(),  // flags
-			vk::ShaderStageFlagBits::eVertex,  // stage
-			pipelineFamily._vertexShader,  // module
-			"main",  // pName
-			specializationInfo,  // pSpecializationInfo
-		};
-	shaderStages[1] =
-		vk::PipelineShaderStageCreateInfo{
-			vk::PipelineShaderStageCreateFlags(),  // flags
-			vk::ShaderStageFlagBits::eFragment,  // stage
-			pipelineFamily._fragmentShader,  // module
-			"main",  // pName
-			nullptr,  // pSpecializationInfo
-		};
-	if(pipelineFamily._geometryShader) {
-		shaderStages[2] =
+	const auto setStage = [&](vk::PipelineShaderStageCreateInfo &stage, vk::ShaderStageFlagBits stageFlags, SharedShaderModule &module) {
+		stage =
 			vk::PipelineShaderStageCreateInfo{
 				vk::PipelineShaderStageCreateFlags(),  // flags
-				vk::ShaderStageFlagBits::eGeometry,  // stage
-				pipelineFamily._geometryShader,  // module
+				stageFlags,  // stage
+				nullptr,  // module
 				"main",  // pName
 				specializationInfo,  // pSpecializationInfo
 			};
+		if (module) {
+			auto* identifier = module.getIdentifier();
+			module.waitIfCompiling();
+			if (module.get()) {
+				stage.module = module;
+			}
+			else if (identifier->identifierSize > 0) {
+				auto index = numShaderIdentifiers++;
+				shaderIdentifierList[index].identifierSize = identifier->identifierSize;
+				shaderIdentifierList[index].pIdentifier = identifier->identifier;
+				stage.pNext = &shaderIdentifierList[index];
+				if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
+					*flags |= vk::PipelineCreateFlagBits2KHR::eFailOnPipelineCompileRequired;
+				}
+				else {
+					createInfo.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+				}
+			}
+			else {
+				std::cerr << "Have no module\n";
+			}
+		}
+	};
+
+	setStage(shaderStages[0], vk::ShaderStageFlagBits::eVertex, pipelineFamily._vertexShader);
+	setStage(shaderStages[1], vk::ShaderStageFlagBits::eFragment, pipelineFamily._fragmentShader);
+	if (pipelineFamily._geometryShader) {
+		setStage(shaderStages[2], vk::ShaderStageFlagBits::eGeometry, pipelineFamily._geometryShader);
 		createInfo.stageCount = 3;
 	}
 	else
 		createInfo.stageCount = 2;
+
 	createInfo.pStages = shaderStages;
 
 	// pVertexInputState
@@ -449,8 +610,51 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	PipelineLibrary::CreationDataBatch::createPipelines(
 		CadR::VulkanDevice& device, vk::PipelineCache pipelineCache)
 {
+	struct Feedback {
+		vk::PipelineCreationFeedbackCreateInfo info;
+		vk::PipelineCreationFeedback feedback;
+		std::array<vk::PipelineCreationFeedback, 3> stageFeedbacks;
+		struct ExtraFeedback {
+			bool hasIdentifier = false;
+		};
+		std::array<ExtraFeedback, 3> stageExtraFeedbacks;
+		bool compileRequired = false;
+
+		void bind(uint32_t stageCount) {
+			assert(stageCount <= stageFeedbacks.size() && "too many stages for feedback");
+			info.pPipelineCreationFeedback = &feedback;
+			info.pipelineStageCreationFeedbackCount = stageCount;
+			info.pPipelineStageCreationFeedbacks = stageFeedbacks.data();
+		}
+	};
+	std::vector<Feedback> feedbacks;
+	if (creationDataSet->pipelineLibrary->_useFeedbackInfo) {
+		feedbacks.resize(numCreateInfos);
+		for (size_t i = 0; i < numCreateInfos; ++i) {
+			auto *dst = reinterpret_cast<vk::BaseOutStructure*>(&createInfoList[i]);
+			while (dst->pNext) {
+				dst = dst->pNext;
+			}
+			feedbacks[i].bind(createInfoList[i].stageCount);
+			dst->pNext = reinterpret_cast<vk::BaseOutStructure*>(&feedbacks[i].info);
+			for (uint32_t j = 0; j < createInfoList[i].stageCount; ++j) {
+				if (createInfoList[i].pStages[j].pNext) {
+					feedbacks[i].stageExtraFeedbacks[j].hasIdentifier = true;
+				}
+			}
+		}
+	}
+
+	if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
+		const auto pipelineLibrary = const_cast<PipelineLibrary*>(creationDataSet->pipelineLibrary);
+		for (size_t i = 0; i < numCreateInfos; ++i) {
+			pipelineLibrary->_binaryCache.process(createInfoList[i]);
+		}
+	}
+
 	// create pipelines
 	array<vk::Pipeline,numPipelines> pipelines;
+	const auto start = std::chrono::system_clock::now();
 	VkResult r =
 		device.vkCreateGraphicsPipelines(
 			device.handle(),
@@ -460,6 +664,103 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 			nullptr,
 			reinterpret_cast<VkPipeline*>(pipelines.data())
 		);
+	const auto end = std::chrono::system_clock::now();
+	CadPL::Debug::log("", "vkCreateGraphicsPipelines()", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+	if(r == VK_PIPELINE_COMPILE_REQUIRED) {
+		array<VkGraphicsPipelineCreateInfo,numPipelines> info2;
+		array<vk::Pipeline,numPipelines> pipelines2;
+		array<size_t,numPipelines> pipelineTargets;
+		uint32_t count = 0;
+		// reduce info array
+		{
+			auto* dst = info2.data();
+			size_t i = 0;
+			while (i<numCreateInfos) {
+				if (pipelines[i]) {
+					++i;
+				}
+				else {
+					auto* src = &createInfoList[i];
+					int span = 1;
+					pipelineTargets[count] = i;
+					++i;
+					while (i<numCreateInfos && !pipelines[i]) {
+						pipelineTargets[count + span] = i;
+						++span;
+						++i;
+					}
+					std::memcpy(dst, src, span*sizeof(vk::GraphicsPipelineCreateInfo));
+					dst += span;
+					count += span;
+				}
+			}
+		}
+
+		const auto setStage = [&](vk::PipelineShaderStageCreateInfo &stage, vk::ShaderModule module) {
+			stage.module = module;
+			stage.pNext = nullptr;
+		};
+		if (creationDataSet->pipelineLibrary->_useFeedbackInfo) {
+			for (uint32_t i=0; i<count; ++i) {
+				auto target = pipelineTargets[i];
+				feedbacks[target].compileRequired = true;
+			}
+		}
+		for (uint32_t i=0; i<count; ++i) {
+			auto target = pipelineTargets[i];
+			PipelineFamily& pipelineFamily = const_cast<PipelineFamily&>(*sharedPipelineList[target].pipelineFamily());
+			auto &info = reinterpret_cast<vk::GraphicsPipelineCreateInfo&>(info2[i]);
+			if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
+				createFlagsList[target].flags = vk::PipelineCreateFlagBits2KHR::eCaptureData;
+			}
+			else {
+				info.flags = {};
+			}
+			assert(info.stageCount >= 2 && "missing pStages");
+			const ShaderState& shaderState = pipelineFamily.shaderState();
+
+			auto &vertex = pipelineFamily._vertexShader;
+			auto &geometry = pipelineFamily._geometryShader;
+			auto &fragment = pipelineFamily._fragmentShader;
+			if (!vertex.get()) {
+				vertex.getIdentifier()->identifierSize = 0;
+			}
+			if (!fragment.get()) {
+				fragment.getIdentifier()->identifierSize = 0;
+			}
+			if (geometry && !geometry.get()) {
+				geometry.getIdentifier()->identifierSize = 0;
+			}
+			pipelineFamily._pipelineLibrary->shaderLibrary().createShaders(
+				shaderState,
+				vertex,
+				geometry,
+				fragment
+			);
+
+			setStage(const_cast<vk::PipelineShaderStageCreateInfo &>(info.pStages[0]), vertex.get());
+			setStage(const_cast<vk::PipelineShaderStageCreateInfo &>(info.pStages[1]), fragment.get());
+			if (info.stageCount > 2) {
+				setStage(const_cast<vk::PipelineShaderStageCreateInfo &>(info.pStages[2]), geometry.get());
+			}
+		}
+		const auto start = std::chrono::system_clock::now();
+		r = device.vkCreateGraphicsPipelines(
+		device.handle(),
+			pipelineCache,
+			count,
+			info2.data(),
+			nullptr,
+			reinterpret_cast<VkPipeline*>(pipelines2.data())
+		);
+		const auto end = std::chrono::system_clock::now();
+		CadPL::Debug::log("", "vkCreateGraphicsPipelines()", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+		for (uint32_t i=0; i<count; ++i) {
+			pipelines[pipelineTargets[i]] = pipelines2[i];
+		}
+		CadPL::Debug::increment("VK_PIPELINE_COMPILE_REQUIRED", count);
+	}
+
 	if(r != VK_SUCCESS) {
 		for(vk::Pipeline p : pipelines)
 			device.destroy(p);
@@ -468,6 +769,72 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	#else
 		vk::detail::throwResultException(vk::Result(r), "vk::Device::createGraphicsPipelines");
 	#endif
+	}
+
+	if (creationDataSet->pipelineLibrary->_useFeedbackInfo) {
+
+		size_t hitCount = 0;
+		size_t missCount = 0;
+		const auto processFeedback = [&](const Feedback &feedback, int index){
+			const auto &flags = feedback.feedback.flags;
+			if (flags & vk::PipelineCreationFeedbackFlagBits::eValid) {
+				std::stringstream debug;
+				debug << "feedback[" << index << "]: { ";
+				if (flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit) {
+					debug << "CacheHit ";
+					++hitCount;
+				}
+				else {
+					++missCount;
+				}
+				if (flags & vk::PipelineCreationFeedbackFlagBits::eBasePipelineAcceleration) {
+					debug << "BaseAcceleration ";
+				}
+				debug << "} ";
+				if (feedback.compileRequired) {
+					debug << "CompileRequired ";
+				}
+				// std::cout << debug.str() << "duration: " << feedback.feedback.duration << " ns\n";
+				// ShaderGenerator::logDebugEvent(std::move(debug.str()), feedback.feedback.duration);
+				for (size_t j=0; j<feedback.stageFeedbacks.size(); ++j) {
+					const auto &stage = feedback.stageFeedbacks[j];
+					const auto &flags = stage.flags;
+					if (flags & vk::PipelineCreationFeedbackFlagBits::eValid) {
+						std::stringstream debug;
+						debug << "  [" << j << "]: { ";
+						if (flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit) {
+							debug << "CacheHit ";
+						}
+						if (flags & vk::PipelineCreationFeedbackFlagBits::eBasePipelineAcceleration) {
+							debug << "BaseAcceleration ";
+						}
+						if (flags & ~(vk::PipelineCreationFeedbackFlagBits::eBasePipelineAcceleration | vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit | vk::PipelineCreationFeedbackFlagBits::eValid)) {
+							debug << static_cast<uint32_t>(flags);
+						}
+						debug << "} ";
+						if (feedback.stageExtraFeedbacks[j].hasIdentifier) {
+							debug << "ModuleIdentifier ";
+						}
+						debug << "duration: " << stage.duration << " ns\n";
+					}
+				}
+			}
+			else {
+				std::cout << "feedback[" << index << "]: invalid\n";
+			}
+		};
+
+		for (size_t i=0; i<numCreateInfos; ++i) {
+			processFeedback(feedbacks[i], i);
+		}
+		CadPL::Debug::increment("cacheHitCount", hitCount);
+		CadPL::Debug::increment("cacheMissCount", missCount);
+	}
+	CadPL::Debug::increment("totalCreateCount", numCreateInfos);
+
+	if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
+		const auto pipelineLibrary = const_cast<PipelineLibrary*>(creationDataSet->pipelineLibrary);
+		// pipelineLibrary->_binaryCache.add(pipelines[0]);
 	}
 	return pipelines;
 }
@@ -595,4 +962,262 @@ bool PipelineState::BlendAttachmentState::operator<(const BlendAttachmentState& 
 	}
 
 	return colorWriteMask < rhs.colorWriteMask;
+}
+
+
+size_t PipelineLibrary::CreationDataSet::count() const
+{
+	size_t count = 0;
+	for (const auto &batch : batchList) count += batch.numCreateInfos;
+	return count;
+}
+
+void PipelineLibrary::CreationDataSet::append(std::map<PipelineState, std::pair<SharedPipeline, std::vector<AsyncCreationData>>> &pipelines, PipelineFamily &family, std::vector<CompilationResultData> &compilationResults)
+{
+	for (auto &data : pipelines) {
+		void *object; // PipelineFamily::PipelineObject
+		if (!data.second.first._pipelineObject) {
+			auto [pipelineIt, newRecord] = family._pipelineMap.try_emplace(data.first);
+			if(newRecord) {
+				family.initializeRecord(pipelineIt);
+			}
+			object = &pipelineIt->second;
+		}
+		else {
+			object = data.second.first._pipelineObject;
+		}
+		append(SharedPipeline(object), data.first);
+
+		compilationResults.emplace_back(CompilationResultData{nullptr, SharedPipeline(object), std::move(data.second.second)});
+	}
+}
+
+void PipelineLibrary::CreationDataSet::createPipelines(PipelineLibrary& pipelineLibrary, std::vector<CompilationResultData> &&compilationResults)
+{
+	size_t compilationResultsIndex = 0;
+
+	// const auto inBatch = compilationResults.size();
+
+	array<vk::Pipeline,CreationDataBatch::numPipelines> pipelines;
+	while(!batchList.empty())
+	{
+		CreationDataBatch& batch = batchList.front();
+		if (batch.numSharedPipelines == 0) {
+			std::cout << "COMPILE NUM: " << batch.numSharedPipelines << "\n";
+		}
+
+		// create pipelines
+		// note: do not throw in the following code until pipelines are safely replaced through
+		// SharedPipeline objects; otherwise pipeline handles will be leaked
+		pipelines = batch.createPipelines(*pipelineLibrary._device, pipelineLibrary._pipelineCache);
+
+		for(size_t i=0, c=batch.numSharedPipelines; i<c; i++)
+			compilationResults[compilationResultsIndex + i].pipeline = pipelines[i];
+		compilationResultsIndex += batch.numSharedPipelines;
+		CadPL::Debug::increment("threadCreateCount", 1);
+
+		// release CreationDataBatch
+		batchList.pop_front();
+	}
+
+	std::unique_lock lk(pipelineLibrary._compilationOutputMutex);
+	pipelineLibrary._compilationOutputQueue.emplace_back(std::move(compilationResults));
+}
+
+void PipelineLibrary::stopBackgroundThread()
+{
+	{
+		std::lock_guard lk(_compilationThreadMutex);
+		if (_compilationThreadExit) {
+			return;
+		}
+		_compilationThreadExit = true;
+		_compilationThreadCondition.notify_one();
+	}
+	if (_compilationThread.joinable()) {
+		_compilationThread.join();
+	}
+}
+
+void PipelineLibrary::asyncEnqueuePipeline(const ShaderState& shaderState, const PipelineState& pipelineState, PipelineLibraryAsyncConsumer *consumer, void *userData, bool delayStart)
+{
+	std::lock_guard lk(_compilationThreadMutex);
+	_compilationQueue[shaderState].pipelines[pipelineState].second.emplace_back(AsyncCreationData{consumer, userData});
+	if (!delayStart) {
+		_compilationThreadCondition.notify_one();
+	}
+}
+
+void PipelineLibrary::asyncEnqueuePipelines(const std::vector<std::pair<SharedPipeline*, AsyncCreationData>> &pipelines)
+{
+	std::lock_guard lk(_compilationThreadMutex);
+	for (auto &data : pipelines) {
+		if (data.first->_pipelineObject) {
+			auto* object = reinterpret_cast<PipelineFamily::PipelineObject*>(data.first->_pipelineObject);
+			auto &entry = _compilationQueue[object->pipelineFamily->shaderState()].pipelines[*data.first->pipelineState()];
+			entry.first = *data.first;
+			entry.second.emplace_back(data.second);
+		}
+	}
+}
+
+void PipelineLibrary::processRequests()
+{
+	// start background compilation if pending
+	{
+		std::lock_guard lk(_compilationThreadMutex);
+		if (!_compilationQueue.empty()) {
+			_compilationThreadCondition.notify_one();
+		}
+	}
+}
+
+void PipelineLibrary::processAsyncQueue(const std::function<void(SharedPipeline, void*)> &callback)
+{
+	std::list<std::vector<CompilationResultData>> output;
+	{
+		std::unique_lock lk(_compilationOutputMutex);
+		if (!_compilationOutputQueue.empty()) {
+			output.swap(_compilationOutputQueue);
+		}
+	}
+	for (auto &batch : output) {
+		for (auto &result : batch) {
+			result.sharedPipeline.replacePipelineHandle(result.pipeline, *_device);
+			for (const auto &target : result.targets) {
+				if (target.consumer) {
+					target.consumer->pipelineCreated(result.sharedPipeline, target.userData);
+				}
+				else if (callback) {
+					callback(result.sharedPipeline, target.userData);
+				}
+			}
+		}
+	}
+}
+
+void PipelineLibrary::processAsyncDebug(size_t maxCount, const std::function<void(SharedPipeline, void*)> &callback) {
+	std::vector<CompilationResultData> output;
+	{
+		std::unique_lock lk(_compilationOutputMutex);
+		if (!_compilationOutputQueue.empty() && output.size() < maxCount) {
+			auto &batch = _compilationOutputQueue.front();
+			while (!batch.empty() && output.size() < maxCount) {
+				output.emplace_back(batch.front());
+				batch.erase(batch.begin());
+			}
+			if (batch.empty()) {
+				_compilationOutputQueue.pop_front();
+			}
+		}
+	}
+	for (auto &result : output) {
+		result.sharedPipeline.replacePipelineHandle(result.pipeline, *_device);
+		for (const auto &target : result.targets) {
+			if (target.consumer) {
+				target.consumer->pipelineCreated(result.sharedPipeline, target.userData);
+			}
+			else if (callback) {
+				callback(result.sharedPipeline, target.userData);
+			}
+		}
+
+	}
+}
+
+void PipelineLibrary::compilationWorker() {
+	while (true) {
+		try {
+			decltype(_compilationQueue) compilations;
+			// wait for signal and take all compilation requests
+			{
+				std::unique_lock lk(_compilationThreadMutex);
+				_compilationThreadCondition.wait(lk, [&]{ return !_compilationQueue.empty() || _compilationThreadExit; });
+				if (_compilationThreadExit) {
+					break;
+				}
+				compilationState = CompilationState::running;
+				Debug::enterThread("compilationWorker");
+				compilations.swap(_compilationQueue);
+			}
+#ifndef NDEBUG
+			// debug validation
+			bool ok = true;
+			for (auto &data : compilations) {
+				for (auto &state : data.second.pipelines) {
+					if(state.first.viewportAndScissorHandling == PipelineState::ViewportAndScissorHandling::SetFunction) {
+						if (_viewportList.size() <= state.first.viewportIndex
+							|| _scissorList.size() <= state.first.scissorIndex)
+						{
+							std::cerr << "COMPILE THREAD: Missing ViewportAndScissorHandling data.\n";
+							ok = false;
+							break;
+						}
+					}
+				}
+			}
+			if (!ok) {
+				continue;
+			}
+#endif
+			const auto start = std::chrono::system_clock::now();
+
+			uint32_t count = 0;
+			for (auto &family : compilations) {
+				count += family.second.pipelines.size();
+			}
+			// std::cout << "COMPILE THREAD: Got " << count << " compilations in " << compilations.size() << "groups \n";
+			std::vector<std::future<void>> futures;
+			{
+				std::unique_lock lk(_pipelineFamilyMapMutex);
+				for (auto &family : compilations) {
+					std::tie(family.second.familyIt, family.second.newRecord) = _pipelineFamilyMap.try_emplace(family.first, *this);
+					auto &f = family.second.familyIt->second;
+					if (family.second.newRecord) {
+						f.initialize(family.first, family.second.familyIt, false);
+						if (f._vertexShader.aquireCompileFlag()) {
+							futures.emplace_back(_shaderLibrary->createVertexShaderAsync(family.first, f._vertexShader));
+						}
+						if (f._fragmentShader.aquireCompileFlag()) {
+							futures.emplace_back(_shaderLibrary->createFragmentShaderAsync(family.first, f._fragmentShader));
+						}
+						if (f._geometryShader && f._geometryShader.aquireCompileFlag()) {
+							futures.emplace_back(_shaderLibrary->createGeometryShaderAsync(family.first, f._geometryShader));
+						}
+					}
+				}
+			}
+
+			std::vector<CompilationResultData> compilationResults;
+			CreationDataSet set(*this);
+
+			if (!futures.empty()) {
+				compilationState = CompilationState::creating_shader;
+				for (auto &f : futures) {
+					if (f.valid()) {
+						f.get();
+					}
+				}
+			}
+
+			compilationState = CompilationState::creating_pipeline;
+			for (auto &familyGroup : compilations) {
+				auto &family = familyGroup.second.familyIt->second;
+				set.append(familyGroup.second.pipelines, family, compilationResults);
+			}
+			set.createPipelines(*this, std::move(compilationResults));
+
+			const auto end = std::chrono::system_clock::now();
+			// std::cout << "TH" << std::this_thread::get_id() << "(compile): compilations done in ";
+			// CadPL::Debug::printDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count(), std::cout);
+			// std::cout << "\n";
+			CadPL::Debug::log("", "threadCompileTime", std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+		} catch(exception &e) {
+			cout << "Failed because of exception: " << e.what() << endl;
+		} catch(...) {
+			cout << "Failed because of unspecified exception." << endl;
+		}
+		compilationState = CompilationState::idle;
+		Debug::exitThread("compilationWorker");
+	}
 }
