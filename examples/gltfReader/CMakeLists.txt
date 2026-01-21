@@ -30,13 +30,43 @@ endif()
 # GUI dependencies
 include(VulkanWindow.cmake)
 VulkanWindowConfigure(APP_SOURCES APP_INCLUDES libs defines includes)
+set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdParty/imgui)
+list(APPEND APP_SOURCES
+	${IMGUI_DIR}/imgui.cpp
+	${IMGUI_DIR}/imgui_draw.cpp
+	${IMGUI_DIR}/imgui_tables.cpp
+	${IMGUI_DIR}/imgui_widgets.cpp
+	${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
+	${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+	)
+
+if(${GUI_TYPE} STREQUAL "Win32")
+	list(APPEND APP_SOURCES ${IMGUI_DIR}/backends/imgui_impl_win32.cpp)
+elseif(${GUI_TYPE} STREQUAL "SDL3")
+	list(APPEND APP_SOURCES ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp)
+elseif(${GUI_TYPE} STREQUAL "SDL2")
+	list(APPEND APP_SOURCES ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp)
+elseif(${GUI_TYPE} STREQUAL "GLFW")
+	list(APPEND APP_SOURCES ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp)
+#elseif(${GUI_TYPE} STREQUAL "Qt6")
+#elseif(${GUI_TYPE} STREQUAL "Qt5")
+else()
+	message(FATAL_ERROR "Unsupported imgui backend: ${GUI_TYPE}")
+endif()
+
 
 # executable
 add_executable(${APP_NAME} ${APP_SOURCES} ${APP_INCLUDES})
 
 # target
-target_include_directories(${APP_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${includes})
-target_compile_definitions(${APP_NAME} PRIVATE ${defines})
+target_include_directories(${APP_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${includes} ${IMGUI_DIR})
+target_compile_definitions(${APP_NAME} PRIVATE ${defines} IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+if(${GUI_TYPE} STREQUAL "GLFW")
+	target_compile_definitions(${APP_NAME} PRIVATE GLFW_INCLUDE_VULKAN)
+endif()
+if (${VULKAN_VALIDATION})
+	target_compile_definitions(${APP_NAME} PRIVATE VULKAN_VALIDATION)
+endif()
 target_link_libraries(${APP_NAME} ${libs} CadR CadPL)
 set_property(TARGET ${APP_NAME} PROPERTY FOLDER "${examples_folder_name}")
 set_property(TARGET ${APP_NAME} PROPERTY CXX_STANDARD 20)

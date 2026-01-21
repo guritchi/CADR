@@ -315,6 +315,32 @@ public:
 	static uint32_t requiredExtensionCount();
 	static const char* const* requiredExtensionNames();
 
+#if defined(USE_PLATFORM_WIN32)
+
+	void* handle() const {
+		return _hwnd;
+	}
+
+#elif defined(USE_PLATFORM_XLIB)
+
+#elif defined(USE_PLATFORM_WAYLAND)
+
+#elif defined(USE_PLATFORM_SDL3) || defined(USE_PLATFORM_SDL2)
+
+	struct SDL_Window* handle() const {
+		return _window;
+	}
+
+#elif defined(USE_PLATFORM_GLFW)
+
+	struct GLFWwindow* handle() const {
+		return _window;
+	}
+
+#elif defined(USE_PLATFORM_QT)
+
+#endif
+
 };
 
 
