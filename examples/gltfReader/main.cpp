@@ -17,7 +17,9 @@
 #include <CadR/VulkanInstance.h>
 #include <CadR/VulkanLibrary.h>
 #include <CadPL/PipelineSceneGraph.h>
+#if defined(USE_PLATFORM_GLFW)
 #include <GLFW/glfw3.h>
+#endif
 
 #include "VulkanWindow.h"
 #include <vulkan/vulkan.hpp>
@@ -890,7 +892,7 @@ void App::init()
 #ifdef VULKAN_VALIDATION
 		{"VK_LAYER_KHRONOS_validation"},
 #else
-		nullptr,
+		{"VK_LAYER_KHRONOS_validation"},
 #endif
 	                      VulkanWindow::requiredExtensions());
 	int width = 1024;

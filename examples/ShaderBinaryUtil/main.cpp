@@ -153,20 +153,20 @@ std::pair<CompileOutput, vk::ShaderStageFlagBits> compileFile(const std::filesys
 
 void dumpSpirvShader(const vk::ShaderCreateInfoEXT &info, const std::string& outputFile) {
     VkShaderEXT shader;
-    auto result = createShadersExt(device.get(), 1, reinterpret_cast<const VkShaderCreateInfoEXT*>(&info), nullptr, &shader);
+    auto result = createShadersExt(device.handle(), 1, reinterpret_cast<const VkShaderCreateInfoEXT*>(&info), nullptr, &shader);
     if (result != VK_SUCCESS) {
         std::cerr << vk::to_string((vk::Result) result) << "\n";
         throw std::runtime_error("createShadersExt failed");
     }
 
     size_t dataSize;
-    result = getShaderBinaryDataEXT(device.get(), shader, &dataSize, nullptr);
+    result = getShaderBinaryDataEXT(device.handle(), shader, &dataSize, nullptr);
     if (result != VK_SUCCESS) {
         throw std::runtime_error("getShaderBinaryDataEXT failed");
     }
     std::vector<unsigned char> data;
     data.resize(dataSize);
-    result = getShaderBinaryDataEXT(device.get(), shader, &dataSize, data.data());
+    result = getShaderBinaryDataEXT(device.handle(), shader, &dataSize, data.data());
     if (result != VK_SUCCESS) {
         throw std::runtime_error("getShaderBinaryDataEXT failed");
     }
@@ -176,7 +176,7 @@ void dumpSpirvShader(const vk::ShaderCreateInfoEXT &info, const std::string& out
     fs.write((const char*)data.data(), data.size());
     fs.close();
 
-    destroyShaderEXT(device.get(), shader, nullptr);
+    destroyShaderEXT(device.handle(), shader, nullptr);
 }
 
 struct ShaderInfo {

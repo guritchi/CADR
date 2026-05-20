@@ -341,7 +341,9 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	createInfo.flags = vk::PipelineCreateFlags();
 	auto *flags = &createFlagsList[numCreateInfos].flags;
 	if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
-		*flags = vk::PipelineCreateFlagBits2KHR::eCaptureData;
+#if VK_HEADER_VERSION > 302
+		*flags = vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
+#endif
 		createInfo.pNext = &createFlagsList[numCreateInfos];
 	}
 	numCreateInfos++;
@@ -711,7 +713,9 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 			PipelineFamily& pipelineFamily = const_cast<PipelineFamily&>(*sharedPipelineList[target].pipelineFamily());
 			auto &info = reinterpret_cast<vk::GraphicsPipelineCreateInfo&>(info2[i]);
 			if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
-				createFlagsList[target].flags = vk::PipelineCreateFlagBits2KHR::eCaptureData;
+#if VK_HEADER_VERSION > 302
+				createFlagsList[target].flags = vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
+#endif
 			}
 			else {
 				info.flags = {};
