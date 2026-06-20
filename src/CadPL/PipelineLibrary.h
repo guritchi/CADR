@@ -206,304 +206,6 @@ public:
 	virtual void pipelineCreated(SharedPipeline pipeline, void *userData) = 0;
 };
 
-class CADPL_EXPORT PipelineBinaryCache {
-
-	const CadR::VulkanDevice* _device = {};
-	PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR = {};
-	PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR = {};
-	PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR = {};
-	PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR = {};
-	PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR = {};
-
-
-	struct PipelineKey : VkPipelineBinaryKeyKHR {
-
-		PipelineKey() = default;
-		PipelineKey(const vk::PipelineBinaryKeyKHR &k) {
-
-		}
-
-		bool operator<(const PipelineKey& rhs) const
-		{
-			if(keySize < rhs.keySize)  return true;
-			if(keySize > rhs.keySize)  return false;
-			for (int i = 0; i < keySize; ++i) {
-				if(key[i] < rhs.key[i])  return true;
-				if(key[i] > rhs.key[i])  return false;
-			}
-			return false;
-		}
-
-	};
-
-	std::map<PipelineKey, int> keys;
-
-public:
-
-	void init(const CadR::VulkanDevice &device) {
-		_device = &device;
-		vkDestroyPipelineBinaryKHR = (PFN_vkDestroyPipelineBinaryKHR)device.getProcAddr("vkDestroyPipelineBinaryKHR");
-		vkGetPipelineKeyKHR = (PFN_vkGetPipelineKeyKHR)device.getProcAddr("vkGetPipelineKeyKHR");
-		vkCreatePipelineBinariesKHR = (PFN_vkCreatePipelineBinariesKHR)device.getProcAddr("vkCreatePipelineBinariesKHR");
-		vkGetPipelineBinaryDataKHR = (PFN_vkGetPipelineBinaryDataKHR)device.getProcAddr("vkGetPipelineBinaryDataKHR");
-		vkReleaseCapturedPipelineDataKHR = (PFN_vkReleaseCapturedPipelineDataKHR)device.getProcAddr("vkReleaseCapturedPipelineDataKHR");
-
-		if (!vkDestroyPipelineBinaryKHR || !vkGetPipelineKeyKHR || !vkGetPipelineBinaryDataKHR || !vkCreatePipelineBinariesKHR || !vkReleaseCapturedPipelineDataKHR) throw std::runtime_error("Unsupported Vulkan functionality");
-	}
-
-
-	~PipelineBinaryCache() {
-
-	}
-
-	vk::PipelineBinaryKeyKHR getPipelineKey(vk::GraphicsPipelineCreateInfo &createInfo) {
-		vk::PipelineCreateInfoKHR pipelineCreateInfo;
-		pipelineCreateInfo.pNext = &createInfo;
-		vk::PipelineBinaryKeyKHR key;
-		VkResult result = vkGetPipelineKeyKHR(_device->handle(), reinterpret_cast<const VkPipelineCreateInfoKHR*>(&pipelineCreateInfo), reinterpret_cast<VkPipelineBinaryKeyKHR*>(&key));
-		if (result != VK_SUCCESS) {
-			return {};
-		}
-		return key;
-	}
-
-	template<typename K>
-	void printKey(const K &key) {
-		for (uint32_t j = 0; j < key.keySize; ++j) {
-			std::cout << std::hex << (int)key.key[j] << std::dec;
-		}
-	}
-
-	void process(vk::GraphicsPipelineCreateInfo &createInfo) {
-
-		auto key = getPipelineKey(createInfo);
-		// std::cout << "pipeline key: ";
-		// printKey(key);
-		// std::cout << "\n";
-		// auto &v = keys[PipelineKey(key)];
-		// if (v > 0) {
-		// 	std::cout << "  " << v << "matches\n";
-		// }
-		// v++;
-
-		vk::PipelineCreateInfoKHR pipelineCreateInfo;
-		pipelineCreateInfo.pNext = &createInfo;
-
-		vk::PipelineBinaryCreateInfoKHR binaryCreateInfo = {};
-		binaryCreateInfo.pPipelineCreateInfo = &pipelineCreateInfo;
-
-		vk::PipelineBinaryHandlesInfoKHR info;
-		std::vector<vk::PipelineBinaryKHR> binaries;
-		VkResult result;
-		do {
-			result = vkCreatePipelineBinariesKHR(_device->handle(), reinterpret_cast<const VkPipelineBinaryCreateInfoKHR*>(&binaryCreateInfo), nullptr, reinterpret_cast<VkPipelineBinaryHandlesInfoKHR*>(&info));
-			if ((result == VK_SUCCESS) && info.pipelineBinaryCount) {
-				binaries.resize(info.pipelineBinaryCount);
-				info.pPipelineBinaries = binaries.data();
-				result = vkCreatePipelineBinariesKHR(_device->handle(), reinterpret_cast<const VkPipelineBinaryCreateInfoKHR*>(&binaryCreateInfo), nullptr, reinterpret_cast<VkPipelineBinaryHandlesInfoKHR*>(&info));
-			}
-		} while (result == VK_INCOMPLETE);
-		if (info.pipelineBinaryCount < binaries.size()) {
-			binaries.resize(info.pipelineBinaryCount);
-		}
-		if(result == VK_PIPELINE_BINARY_MISSING_KHR) {
-			// std::cout << "No binary data\n";
-			return;
-		}
-		else if (result != VK_SUCCESS) {
-			std::cerr << "vkCreatePipelineBinariesKHR() failed: " << vk::to_string((vk::Result)result) << '\n';
-			return;
-		}
-
-		std::cout << "got " << binaries.size() << " handles\n";
-		// std::vector<vk::PipelineBinaryKeyKHR> keys;
-		// keys.resize(binaries.size());
-		for (size_t i = 0; i < binaries.size(); ++i) {
-			vk::PipelineBinaryDataInfoKHR binaryInfo;
-			binaryInfo.pipelineBinary = binaries[i];
-
-			vk::PipelineBinaryKeyKHR key = {};
-			size_t binaryDataSize = 0;
-			VkResult result = vkGetPipelineBinaryDataKHR(_device->handle(), reinterpret_cast<const VkPipelineBinaryDataInfoKHR*>(&binaryInfo), reinterpret_cast<VkPipelineBinaryKeyKHR*>(&key), &binaryDataSize, nullptr);
-			if (key.keySize > 0) {
-				std::cout << "[" << i << "] key: ";
-				printKey(key);
-				std::cout << ", data: " << binaryDataSize << "B\n";
-			}
-			if(result != VK_SUCCESS) {
-				std::cerr << "vkGetPipelineBinaryDataKHR() failed: " << vk::to_string((vk::Result)result) << '\n';
-				break;
-			}
-
-			std::vector<uint8_t> binaryData;
-			binaryData.resize(binaryDataSize);
-			result = vkGetPipelineBinaryDataKHR(_device->handle(), reinterpret_cast<const VkPipelineBinaryDataInfoKHR*>(&binaryInfo), reinterpret_cast<VkPipelineBinaryKeyKHR*>(&key), &binaryDataSize, binaryData.data());
-		}
-
-	}
-
-	void add(vk::Pipeline pipeline) {
-		const auto handle = _device->handle();
-		vk::PipelineBinaryCreateInfoKHR createInfo = {};
-		createInfo.pipeline = pipeline;
-		vk::PipelineBinaryHandlesInfoKHR info;
-		std::vector<vk::PipelineBinaryKHR> binaries;
-
-		VkResult result;
-		do {
-			result = vkCreatePipelineBinariesKHR(handle, reinterpret_cast<const VkPipelineBinaryCreateInfoKHR*>(&createInfo), nullptr, reinterpret_cast<VkPipelineBinaryHandlesInfoKHR*>(&info));
-			if ((result == VK_SUCCESS) && info.pipelineBinaryCount) {
-				binaries.resize(info.pipelineBinaryCount);
-				info.pPipelineBinaries = binaries.data();
-				result = vkCreatePipelineBinariesKHR(handle, reinterpret_cast<const VkPipelineBinaryCreateInfoKHR*>(&createInfo), nullptr, reinterpret_cast<VkPipelineBinaryHandlesInfoKHR*>(&info));
-			}
-		} while (result == VK_INCOMPLETE);
-		if (info.pipelineBinaryCount < binaries.size()) {
-			binaries.resize(info.pipelineBinaryCount);
-		}
-		if (result != VK_SUCCESS) {
-			std::cerr << "vkCreatePipelineBinariesKHR() failed: " << vk::to_string((vk::Result)result) << '\n';
-		}
-		else {
-			std::cout << "got " << binaries.size() << " handles\n";
-			if (binaries.size() == 0) {
-				return;
-			}
-			std::vector<vk::PipelineBinaryKeyKHR> keys;
-			keys.resize(binaries.size());
-			for (size_t i = 0; i < binaries.size(); ++i) {
-				vk::PipelineBinaryDataInfoKHR binaryInfo;
-				binaryInfo.pipelineBinary = binaries[i];
-
-				size_t binaryDataSize = 0;
-				VkResult result = vkGetPipelineBinaryDataKHR(handle, reinterpret_cast<const VkPipelineBinaryDataInfoKHR*>(&binaryInfo), reinterpret_cast<VkPipelineBinaryKeyKHR*>(&keys[i]), &binaryDataSize, nullptr);
-				if(result != VK_SUCCESS) {
-					break;
-				}
-
-				std::cout << "[" << i << "] key: ";
-				for (uint32_t j = 0; j < keys[i].keySize; ++j) {
-					std::cout << std::hex << (int)keys[i].key[j] << std::dec;
-				}
-				std::cout << ", data: " << binaryDataSize << "B\n";
-
-			}
-			for (size_t i = 0; i < binaries.size(); ++i) {
-				vkDestroyPipelineBinaryKHR(handle, binaries[i], nullptr);
-			}
-			if(result != VK_SUCCESS) {
-#if VK_HEADER_VERSION < 256  // throwResultException moved to detail namespace on 2023-06-28 and the change went public in 1.3.256
-				vk::throwResultException(vk::Result(r), "vk::Device::vkGetPipelineBinaryDataKHR");
-#else
-				vk::detail::throwResultException(vk::Result(result), "vk::Device::vkGetPipelineBinaryDataKHR");
-#endif
-			}
-		}
-		vk::ReleaseCapturedPipelineDataInfoKHR releaseInfo;
-		releaseInfo.pipeline = pipeline;
-		vkReleaseCapturedPipelineDataKHR(handle, reinterpret_cast<const VkReleaseCapturedPipelineDataInfoKHR*>(&releaseInfo), nullptr);
-	}
-
-};
-
-
-class CADPL_EXPORT GraphicsPipelineLibrary {
-
-protected:
-	ShaderLibrary* _shaderLibrary;
-
-	struct LibraryObject {
-		vk::Pipeline pipeline;
-	};
-
-
-	struct PrerasterState {
-		vk::Viewport viewport;
-		vk::Rect2D scissor;
-
-		vk::CullModeFlagBits cullMode = vk::CullModeFlagBits::eBack;
-		vk::FrontFace frontFace = vk::FrontFace::eCounterClockwise;
-		bool depthBiasDynamicState = false;
-		bool depthBiasEnable = false;
-		float depthBiasConstantFactor;
-		float depthBiasClamp;
-		float depthBiasSlopeFactor;
-		bool lineWidthDynamicState = false;
-		float lineWidth = 1.f;
-
-		vk::RenderPass renderPass = nullptr;
-		uint32_t subpass = 0;
-	};
-
-	struct LibraryFamily {
-		std::map<PrerasterState, LibraryObject> objects;
-		SharedShaderModule vertex;
-	};
-	std::map<VertexShaderState, LibraryFamily> _preraster;
-
-public:
-
-	void getOrCreate(const ShaderState& shaderState) {
-/*
-		auto shaders = _shaderLibrary->getOrCreateShaders(shaderState);
-
-		vk::SpecializationInfo* specializationInfo =
-	(shaderState.projectionHandling == ShaderState::ProjectionHandling::PerspectivePushAndSpecializationConstants)
-		? &get<1>(creationDataSet->specializationList.at(pipelineState.projectionIndex))
-		: nullptr;
-
-		const auto setStage = [&](vk::PipelineShaderStageCreateInfo &stage, vk::ShaderStageFlagBits stageFlags, SharedShaderModule &module) {
-		stage =
-			vk::PipelineShaderStageCreateInfo{
-				vk::PipelineShaderStageCreateFlags(),  // flags
-				stageFlags,  // stage
-				nullptr,  // module
-				"main",  // pName
-				specializationInfo,  // pSpecializationInfo
-			};
-		if (module) {
-			auto* identifier = module.getIdentifier();
-			if (module.get()) {
-				stage.module = module;
-			}
-			else if (identifier->identifierSize > 0) {
-				std::cerr << "Not implemented yet\n";
-				// auto index = numShaderIdentifiers++;
-				// shaderIdentifierList[index].identifierSize = identifier->identifierSize;
-				// shaderIdentifierList[index].pIdentifier = identifier->identifier;
-				// stage.pNext = &shaderIdentifierList[index];
-				// if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
-				// 	*flags |= vk::PipelineCreateFlagBits2KHR::eFailOnPipelineCompileRequired;
-				// }
-				// else {
-				// 	createInfo.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-				// }
-			}
-			else {
-				std::cerr << "Have no module\n";
-			}
-		}
-	};
-
-		auto [it1, newRecord1] = _preRasterMap.try_emplace(ShaderLibrary::VertexShaderMapKey(shaderState));
-		if(newRecord1) {
-			vk::GraphicsPipelineCreateInfo info = {};
-			if (shaders.fragment.get()) {
-
-			}
-		}
-
-		// auto [it2, newRecord2] = _preRasterMap.try_emplace(ShaderLibrary::VertexShaderMapKey(shaderState));
-		// if(newRecord2) {
-		//
-		//
-		// }
-*/
-	}
-
-
-};
-
 
 class CADPL_EXPORT PipelineLibrary {
 protected:
@@ -513,7 +215,6 @@ protected:
 	std::mutex _pipelineFamilyMapMutex;
 	CadR::VulkanDevice* _device;
 
-	PipelineBinaryCache _binaryCache; // TODO to pointer
 	vk::PipelineCache _pipelineCache;
 
 	std::vector<std::array<float,6>> _specializationData;
@@ -521,7 +222,6 @@ protected:
 	std::vector<vk::Rect2D> _scissorList;
 
 	bool _useFeedbackInfo = false;
-	bool _usePipelineBinary = false;
 
 	struct CreationDataSet;  // forward declaration
 
@@ -550,7 +250,6 @@ protected:
 		unsigned numColorBlendAttachmentStates = 0;
 		std::array<vk::PipelineColorBlendStateCreateInfo,numPipelines> colorBlendStateList;
 		unsigned numColorBlendStates = 0;
-		std::array<vk::PipelineCreateFlags2CreateInfoKHR,numPipelines>  createFlagsList;
 		std::array<vk::GraphicsPipelineCreateInfo,numPipelines> createInfoList;
 		std::array<PipelineFamily*,numPipelines> familyList;
 		unsigned numCreateInfos = 0;
@@ -652,7 +351,6 @@ public:
 
 	size_t count() noexcept;
 	void setFeedbackInfoEnabled(bool enabled);
-	void setPipelineBinaryEnabled(bool enabled, const CadR::VulkanDevice &device);
 
 	enum class CompilationState {
 		idle,
@@ -703,6 +401,5 @@ inline const std::vector<vk::DescriptorSetLayout>& PipelineLibrary::descriptorSe
 inline size_t PipelineFamily::count() noexcept { return _pipelineMap.size(); }
 inline size_t PipelineLibrary::count() noexcept { size_t s = 0; std::unique_lock lk(_pipelineFamilyMapMutex); for (auto &p : _pipelineFamilyMap) s += p.second.count(); return s; }
 inline void PipelineLibrary::setFeedbackInfoEnabled(bool enabled) { _useFeedbackInfo = enabled; }
-inline void PipelineLibrary::setPipelineBinaryEnabled(bool enabled, const CadR::VulkanDevice &device) { _usePipelineBinary = enabled; if (enabled) { _binaryCache.init(device); } }
 
 }

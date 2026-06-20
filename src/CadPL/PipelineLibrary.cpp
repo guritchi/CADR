@@ -339,13 +339,6 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	// flags
 	auto& createInfo = createInfoList[numCreateInfos];
 	createInfo.flags = vk::PipelineCreateFlags();
-	auto *flags = &createFlagsList[numCreateInfos].flags;
-	if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
-#if VK_HEADER_VERSION > 302
-		*flags = vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
-#endif
-		createInfo.pNext = &createFlagsList[numCreateInfos];
-	}
 	numCreateInfos++;
 
 	// specializationInfo
@@ -377,12 +370,7 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 				shaderIdentifierList[index].identifierSize = identifier->identifierSize;
 				shaderIdentifierList[index].pIdentifier = identifier->identifier;
 				stage.pNext = &shaderIdentifierList[index];
-				if (pipelineFamily._pipelineLibrary->_usePipelineBinary) {
-					*flags |= vk::PipelineCreateFlagBits2KHR::eFailOnPipelineCompileRequired;
-				}
-				else {
-					createInfo.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-				}
+				createInfo.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 			}
 			else {
 				std::cerr << "Have no module\n";
@@ -647,13 +635,6 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 		}
 	}
 
-	if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
-		const auto pipelineLibrary = const_cast<PipelineLibrary*>(creationDataSet->pipelineLibrary);
-		for (size_t i = 0; i < numCreateInfos; ++i) {
-			pipelineLibrary->_binaryCache.process(createInfoList[i]);
-		}
-	}
-
 	// create pipelines
 	array<vk::Pipeline,numPipelines> pipelines;
 	const auto start = std::chrono::system_clock::now();
@@ -712,14 +693,7 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 			auto target = pipelineTargets[i];
 			PipelineFamily& pipelineFamily = const_cast<PipelineFamily&>(*sharedPipelineList[target].pipelineFamily());
 			auto &info = reinterpret_cast<vk::GraphicsPipelineCreateInfo&>(info2[i]);
-			if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
-#if VK_HEADER_VERSION > 302
-				createFlagsList[target].flags = vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
-#endif
-			}
-			else {
-				info.flags = {};
-			}
+			info.flags = {};
 			assert(info.stageCount >= 2 && "missing pStages");
 			const ShaderState& shaderState = pipelineFamily.shaderState();
 
@@ -836,10 +810,6 @@ void PipelineLibrary::CreationDataBatch::append(SharedPipeline&& sharedPipeline,
 	}
 	CadPL::Debug::increment("totalCreateCount", numCreateInfos);
 
-	if (creationDataSet->pipelineLibrary->_usePipelineBinary) {
-		const auto pipelineLibrary = const_cast<PipelineLibrary*>(creationDataSet->pipelineLibrary);
-		// pipelineLibrary->_binaryCache.add(pipelines[0]);
-	}
 	return pipelines;
 }
 

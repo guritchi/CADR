@@ -551,7 +551,6 @@ public:
 	bool pipelineCreationCacheControlSupported = false;
 	bool shaderModuleIdentifierSupported = false;
 	bool pipelineBinarySupported = false;
-	bool graphicsPipelineLibrarySupported = false;
 	bool useUberShader = true;
 	bool usePBR = true;
 	bool noPause = true;
@@ -1017,21 +1016,13 @@ void App::init()
 			}
 		}
 	}
-	if (hasDynamicRendering && hasMaintenance5Extension && hasPipelineBinaryExtension) {
+	if (disableInternalCache && hasDynamicRendering && hasMaintenance5Extension && hasPipelineBinaryExtension) {
 		pipelineBinarySupported = features.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries;
 		if (pipelineBinarySupported) {
 			extensions.emplace_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 			extensions.emplace_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 			extensions.emplace_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 			pipelineBinaryFeatures.pipelineBinaries = true;
-		}
-	}
-	if (hasPipelineLibraryExtension && hasGraphicsPipelineLibraryExtension) {
-		graphicsPipelineLibrarySupported = features.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>().graphicsPipelineLibrary;
-		if (graphicsPipelineLibrarySupported) {
-			extensions.emplace_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
-			extensions.emplace_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
-			graphicsPipelineLibraryFeatures.graphicsPipelineLibrary = true;
 		}
 	}
 
@@ -1093,11 +1084,6 @@ void App::init()
 				last->pNext = ptr;
 				last = ptr;
 			}
-			if (graphicsPipelineLibrarySupported) {
-				auto *ptr = reinterpret_cast<vk::BaseOutStructure*>(&graphicsPipelineLibraryFeatures);
-				last->pNext = ptr;
-				last = ptr;
-			}
 			if (binaryInternalCacheControl.disableInternalCache) {
 				auto *ptr = reinterpret_cast<vk::BaseOutStructure*>(&binaryInternalCacheControl);
 				last->pNext = ptr;
@@ -1127,16 +1113,11 @@ void App::init()
 	renderer.init(device, vulkanInstance, physicalDevice, graphicsQueueFamily);
 	renderer.setCollectFrameInfo(true, calibratedTimestampsSupported);
 
-	pipelineBinarySupported = false;
-
 	// CadPL init
 	CadPL::ShaderGenerator::initialize();
 	CadPL::ShaderGenerator::initializeCache(CadPL::ShaderGenerator::defaultCacheDirectory(), clearCache);
 	size_t loadedCacheSize = 0;
-	pipelineCache = nullptr;
-	if (!pipelineBinarySupported) {
-		pipelineCache = CadPL::ShaderGenerator::loadPipelineCache(device, vulkanInstance.getPhysicalDeviceProperties(physicalDevice), vk::PipelineCacheCreateFlags(), &loadedCacheSize);
-	}
+	pipelineCache = CadPL::ShaderGenerator::loadPipelineCache(device, vulkanInstance.getPhysicalDeviceProperties(physicalDevice), vk::PipelineCacheCreateFlags(), &loadedCacheSize);
 
 	currentOptimizeFlags = *OptimizeLevels.begin();
 	std::vector<std::bitset<CadPL::ShaderState::numOptimizeFlags>> optimizationLevels = {currentOptimizeFlags};
@@ -1153,20 +1134,6 @@ void App::init()
 		}
 	}
 	pipelineLibrary->setFeedbackInfoEnabled(pipelineCreationFeedbackSupported);
-	pipelineLibrary->setPipelineBinaryEnabled(pipelineBinarySupported, device);
-
-	// debug placeholder
-	// auto newSurfaceExtent = vk::Extent2D{800, 800};
-	// constexpr float zNear = 0.5f;
-	// constexpr float zFar = 100.f;
-	// glm::mat4 projectionMatrix = glm::perspectiveLH_ZO(fovy, float(newSurfaceExtent.width)/newSurfaceExtent.height, zNear, zFar);
-	// pipelineSceneGraph.setProjectionViewportAndScissor(
-	// 	projectionMatrix,
-	// 	vk::Viewport(0.f, 0.f,
-	// 				 float(newSurfaceExtent.width), float(newSurfaceExtent.height),
-	// 				 0.f, 1.f),
-	// 	vk::Rect2D(vk::Offset2D(0, 0), newSurfaceExtent)
-	// );
 
 
 	// get queues
@@ -4445,10 +4412,6 @@ void App::renderGUI() {
 					ImGui::Text(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 					ImGui::Text(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 					ImGui::Text(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
-				}
-				if (graphicsPipelineLibrarySupported) {
-					ImGui::Text(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
-					ImGui::Text(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 				}
 				ImGui::TreePop();
 			}
